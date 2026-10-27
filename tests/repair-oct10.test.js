@@ -4,12 +4,12 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import Database from 'better-sqlite3';
+import { openDatabase } from '../src/db/sqlite.js';
 
 const dir = mkdtempSync(join(tmpdir(), 'charon-repair-'));
 process.env.DB_PATH = join(dir, 'test.sqlite');
 process.env.GMGN_ENABLED = 'true';
-const seed = new Database(process.env.DB_PATH);
+const seed = openDatabase(process.env.DB_PATH);
 seed.exec('CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
 seed.prepare('INSERT INTO settings VALUES (?,?)').run('gmgn_request_delay_ms', '0');
 seed.close();
@@ -63,4 +63,9 @@ test('GMGN queue cannot park execution indefinitely behind discovery', async () 
   assert.match(result, /deadline|timeout/);
   global.fetch = originalFetch;
 });
-test.after(() => { global.fetch = originalFetch; rmSync(dir, { recursive: true, force: true }); });
+test.after(async () => {
+  global.fetch = originalFetch;
+  // Windows cannot delete a SQLite file that is still open.
+  (await import('../src/db/connection.js')).db.close();
+  rmSync(dir, { recursive: true, force: true });
+});

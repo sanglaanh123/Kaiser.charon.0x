@@ -3,10 +3,10 @@ import { TELEGRAM_CHAT_ID, TELEGRAM_TOPIC_ID, DB_PATH } from '../config.js';
 import { generateDailyCard } from '../visuals/dailyCard.js';
 import { escapeHtml } from '../format.js';
 import { writeFileSync, unlinkSync } from 'fs';
-import Database from 'better-sqlite3';
+import { openDatabase } from '../db/sqlite.js';
 
 export async function buildDailyReport() {
-  const db = new Database(DB_PATH);
+  const db = openDatabase(DB_PATH);
   try {
     const now = Date.now();
     // Start of today in Jakarta time (UTC+7): midnight WIB = UTC midnight - 7h

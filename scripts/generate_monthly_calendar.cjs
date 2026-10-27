@@ -1,4 +1,4 @@
-const Database = require('better-sqlite3');
+const { DatabaseSync } = require('node:sqlite');
 const { createCanvas, registerFont } = require('canvas');
 const fs = require('fs');
 const https = require('https');
@@ -62,7 +62,7 @@ async function main() {
   const solUsd = await getLiveSolPrice();
   console.log(`Live SOL/USD: $${solUsd.toFixed(2)}`);
 
-  const db = new Database('/home/ubuntu/projects/charon/charon.sqlite', { readonly: true });
+  const db = new DatabaseSync('/home/ubuntu/projects/charon/charon.sqlite', { readOnly: true });
   
   // Pull all closed trades in Sep 2026 in WIB (+7 hours)
   const rows = db.prepare(`

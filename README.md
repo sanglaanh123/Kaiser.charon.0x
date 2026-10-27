@@ -24,7 +24,7 @@ Jump to: [What this fork changes](#what-this-fork-changes) · [Quick start](#qui
 
 ## Quick start
 
-Requirements: Node.js 22 and a Telegram bot token. `better-sqlite3` and `canvas` are native modules; there is no `better-sqlite3` prebuild for Node 26, so on Windows (or anywhere without build tools) stay on Node 22. On Linux install `build-essential python3 pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev` first.
+Requirements: Node.js 22.13 or newer (Node 26 works) and a Telegram bot token. The database uses the built-in `node:sqlite` module, so there is nothing to compile for it; on Node 22 it prints a one-time `ExperimentalWarning`, which is harmless. `canvas` (used for the Telegram cards) ships prebuilds; if your platform has none, install `build-essential python3 pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev` first.
 
 ```bash
 git clone https://github.com/sanglaanh123/Kaiser.charon.0x.git

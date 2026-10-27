@@ -29,7 +29,7 @@ EXECUTION (looping):
 ```
 
 ## Prasyarat
-- **Node.js 20+** (gw pake 22)
+- **Node.js 22.13+** (Node 26 juga jalan; DB pake `node:sqlite` bawaan, ga perlu build native)
 - **Native build tools**: `build-essential python3 pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev`
 - **Systemd** (buat production supervisor) atau pm2
 
@@ -42,7 +42,7 @@ cd Kaiser.charon
 
 # 2. Install
 npm install
-# Kalo gagal di better-sqlite3/canvas → install build tools dulu (lihat Prasyarat)
+# Kalo gagal di canvas → install build tools dulu (lihat Prasyarat)
 
 # 3. Setup env
 cp .env.example .env
@@ -215,7 +215,7 @@ charon/
 ## Troubleshooting
 | Masalah | Cek |
 |---|---|
-| `better-sqlite3` / `canvas` gagal build | Install native deps (lihat Prasyarat) |
+| `canvas` gagal build | Install native deps (lihat Prasyarat) |
 | `X is required` pas start | Pesan error nyebut var yg kurang (`TELEGRAM_BOT_TOKEN`, `JUPITER_API_KEY`, `GMGN_API_KEY`, `TYPESAFE_API_KEY`; live/confirm: `SOLANA_PRIVATE_KEY` + RPC) |
 | Bot start tapi ga ada sinyal | `SIGNAL_SERVER_KEY` valid? Cek log `[bot]` |
 | Jev ga manggil | `ENABLE_JEV` bukan `false`? `TYPESAFE_API_KEY` ada? |

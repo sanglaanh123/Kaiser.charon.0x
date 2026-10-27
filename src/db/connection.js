@@ -1,7 +1,7 @@
-import Database from 'better-sqlite3';
+import { openDatabase } from './sqlite.js';
 import { DB_PATH } from '../config.js';
 
-export const db = new Database(DB_PATH);
+export const db = openDatabase(DB_PATH);
 
 export function initDb() {
   db.pragma('journal_mode = WAL');

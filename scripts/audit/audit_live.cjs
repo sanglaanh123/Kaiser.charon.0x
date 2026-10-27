@@ -5,7 +5,7 @@
  */
 'use strict';
 
-const Database = require('better-sqlite3');
+const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
 
@@ -20,12 +20,11 @@ const OUT_DIR = __dirname;
 if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 const REPORT_PATH = path.join(OUT_DIR, 'SHADOW_LIVE_AUDIT_2026-08-03.txt');
 
-const db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
-db.pragma('busy_timeout = 30000');
+const db = new DatabaseSync(DB_PATH, { readOnly: true, timeout: 30000 });
 
 function q(sql) { return db.prepare(sql).all(); }
 function q1(sql) { return db.prepare(sql).get(); }
-function qv(sql) { return db.prepare(sql).pluck().all(); }
+function qv(sql) { return db.prepare(sql).all().map(r => Object.values(r)[0]); }
 
 const solLamports = 1e9;
 

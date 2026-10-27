@@ -1,6 +1,6 @@
 // Monthly PnL report for Charon. Usage: node scripts/monthlyPnl.js [YYYY-MM]
 // WIB month boundaries (matches the bot's report convention).
-import Database from 'better-sqlite3';
+import { openDatabase } from '../src/db/sqlite.js';
 import { writeFileSync } from 'fs';
 import { DB_PATH } from '../src/config.js';
 import { generateDailyCard } from '../src/visuals/dailyCard.js';
@@ -11,7 +11,7 @@ const [y, m] = month.split('-').map(Number);
 const startMs = Date.UTC(y, m - 1, 1) - WIB;
 const endMs = Date.UTC(y, m, 1) - WIB;
 
-const db = new Database(DB_PATH, { readonly: true });
+const db = openDatabase(DB_PATH, { readonly: true });
 const rows = db.prepare(`
   SELECT id, symbol, strategy_id, size_sol, pnl_sol, pnl_percent, exit_reason,
          opened_at_ms, closed_at_ms
