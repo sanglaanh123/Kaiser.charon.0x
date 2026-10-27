@@ -118,6 +118,7 @@ export async function handleMessage(msg) {
       return bot.sendMessage(chatId, `Paper wallet reset. ${paperWalletLine()}`);
     } catch (err) {
       if (err.message === 'paper_reset_open_positions') return bot.sendMessage(chatId, 'Cannot reset: close all open paper positions first.');
+      if (err.message === 'paper_start_pinned_by_env') return bot.sendMessage(chatId, 'Starting balance is set by PAPER_STARTING_BALANCE_SOL in .env. Change it there and restart, or use /paper_reset without a number.');
       return bot.sendMessage(chatId, `Reset failed: ${err.message}`);
     }
   }

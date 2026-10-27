@@ -102,6 +102,21 @@ test('createDryRunPosition fills, locks, then rejects when balance is too low', 
   assert.equal(JSON.parse(ev.evidence_json).reason, 'paper_insufficient_balance');
 });
 
+test('PAPER_STARTING_BALANCE_SOL in env pins the starting balance', () => {
+  clear();
+  process.env.PAPER_STARTING_BALANCE_SOL = '3';
+  try {
+    near(paperWalletState().startSol, 3);
+    near(paperWalletState().balanceSol, 3);
+    assert.throws(() => resetPaperWallet({ startSol: 2 }), /paper_start_pinned_by_env/);
+    near(resetPaperWallet().startSol, 3);
+    process.env.PAPER_STARTING_BALANCE_SOL = 'abc';
+    assert.throws(() => paperWalletState(), /PAPER_STARTING_BALANCE_SOL/);
+  } finally {
+    process.env.PAPER_STARTING_BALANCE_SOL = '';
+  }
+});
+
 test('resetPaperWallet refuses with open positions, otherwise moves epoch', () => {
   clear(); insert();
   assert.throws(() => resetPaperWallet(), /paper_reset_open_positions/);

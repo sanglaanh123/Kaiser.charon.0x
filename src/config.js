@@ -67,12 +67,23 @@ export const JSON_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
 };
 
+// Paper wallet starting balance pinned from .env; null = use the DB setting (/paper_reset [sol]).
+// Read at call time so tests can toggle it.
+export function paperStartingBalanceEnv() {
+  const raw = process.env.PAPER_STARTING_BALANCE_SOL;
+  if (raw == null || raw.trim() === '') return null;
+  const sol = Number(raw);
+  if (!Number.isFinite(sol) || sol <= 0) throw new Error('PAPER_STARTING_BALANCE_SOL must be a number > 0.');
+  return sol;
+}
+
 export function validateConfig() {
   if (!TELEGRAM_BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required.');
   if (!TELEGRAM_CHAT_ID) throw new Error('TELEGRAM_CHAT_ID is required.');
   if (!JUPITER_API_KEY) throw new Error('JUPITER_API_KEY is required (Jupiter free tier needs a key; get one at portal.jup.ag).');
   if (GMGN_ENABLED && !GMGN_API_KEY) throw new Error('GMGN_API_KEY is required unless GMGN_ENABLED=false.');
   if (ENABLE_JEV && !TYPESAFE_API_KEY) throw new Error('TYPESAFE_API_KEY is required unless ENABLE_JEV=false.');
+  paperStartingBalanceEnv();
 
   // Wallet + RPC only matter when real transactions can happen. trading_mode can also be switched
   // from Telegram at runtime; requireLiveExecution() fails with a clear error at live-use time.
