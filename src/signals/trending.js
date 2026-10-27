@@ -1,10 +1,9 @@
-import axios from 'axios';
-import { JUPITER_API_KEY, JSON_HEADERS, TRENDING_LOOKBACK_MS } from '../config.js';
+import { JUPITER_API_KEY, TRENDING_LOOKBACK_MS } from '../config.js';
 import { now, json } from '../utils.js';
 import { numSetting, boolSetting, setting } from '../db/settings.js';
 import { db } from '../db/connection.js';
 import { gmgnBackoffActive, setGmgnBackoff, gmgnFetch, normalizedTrendingRows } from '../enrichment/gmgn.js';
-import { normalizeJupiterTrendingRow } from '../enrichment/jupiter.js';
+import { normalizeJupiterTrendingRow, jupiterFetch } from '../enrichment/jupiter.js';
 
 export const trending = new Map();
 let degenHandler = null;
@@ -65,10 +64,7 @@ export async function fetchJupiterTrendingRows(interval, limit) {
   const window = supported.has(interval) ? interval : '5m';
   const url = new URL(`https://api.jup.ag/tokens/v2/toptrending/${window}`);
   url.searchParams.set('limit', String(limit));
-  const res = await axios.get(url.toString(), {
-    timeout: 10_000,
-    headers: { ...JSON_HEADERS, 'x-api-key': JUPITER_API_KEY },
-  });
+  const res = await jupiterFetch(url.toString(), { priority: 'enrich' });
   const rows = Array.isArray(res.data) ? res.data : [];
   return rows.map((row, index) => normalizeJupiterTrendingRow(row, window, index + 1));
 }

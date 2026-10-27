@@ -1,4 +1,3 @@
-import axios from 'axios';
 import bs58 from 'bs58';
 import {
   Connection,
@@ -13,11 +12,11 @@ import {
   JUPITER_API_KEY,
   JUPITER_SLIPPAGE_BPS,
   JUPITER_SWAP_BASE_URL,
-  JSON_HEADERS,
   SOLANA_PRIVATE_KEY,
   SOLANA_RPC_URL,
   WSOL_MINT,
 } from './config.js';
+import { jupiterFetch } from './enrichment/jupiter.js';
 
 let liveWallet = null;
 let solanaConnection = null;
@@ -100,7 +99,7 @@ export async function closeEmptyTokenAccounts(mint) {
   });
 }
 
-async function jupiterOrder({ inputMint, outputMint, amount }) {
+async function jupiterOrder({ inputMint, outputMint, amount }, priority = 'entry') {
   requireLiveExecution();
   const url = new URL(`${JUPITER_SWAP_BASE_URL.replace(/\/$/, '')}/order`);
   url.searchParams.set('inputMint', inputMint);
@@ -108,10 +107,7 @@ async function jupiterOrder({ inputMint, outputMint, amount }) {
   url.searchParams.set('amount', String(amount));
   url.searchParams.set('taker', liveWallet.publicKey.toBase58());
   url.searchParams.set('slippageBps', String(JUPITER_SLIPPAGE_BPS));
-  const res = await axios.get(url.toString(), {
-    timeout: 20_000,
-    headers: { ...JSON_HEADERS, 'x-api-key': JUPITER_API_KEY },
-  });
+  const res = await jupiterFetch(url.toString(), { priority, timeoutMs: 20_000 });
   const order = res.data;
   if (order.errorCode || order.error) {
     throw new Error(`Jupiter order failed: ${order.errorMessage || order.error || order.errorCode}`);
@@ -135,9 +131,8 @@ async function jupiterExecute(order, signedTransaction) {
     signedTransaction,
     requestId: order.requestId,
   };
-  const res = await axios.post(`${JUPITER_SWAP_BASE_URL.replace(/\/$/, '')}/execute`, body, {
-    timeout: 30_000,
-    headers: { ...JSON_HEADERS, 'content-type': 'application/json', 'x-api-key': JUPITER_API_KEY },
+  const res = await jupiterFetch(`${JUPITER_SWAP_BASE_URL.replace(/\/$/, '')}/execute`, {
+    method: 'POST', body, bucket: 'execute', priority: 'exit_live', timeoutMs: 30_000,
   });
   return res.data;
 }

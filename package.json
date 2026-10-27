@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/liveExecutor.js",
+    "check": "node --check index.js && node --check src/app.js && node --check src/config.js && node --check src/liveExecutor.js && node --check src/enrichment/jupiter.js && node --check src/enrichment/market.js && node --check tests/jupiter-client.test.js",
     "test": "node --test --test-force-exit --test-timeout=20000 tests/*.test.js"
   },
   "dependencies": {

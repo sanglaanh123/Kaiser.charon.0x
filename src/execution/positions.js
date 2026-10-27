@@ -7,6 +7,7 @@ import { firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn, computeAtrP
 import { fetchGmgnTokenInfo } from '../enrichment/gmgn.js';
 import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote, fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { liveWalletPubkey } from '../liveExecutor.js';
+import { fetchChartContextCached } from '../enrichment/market.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
 import { openPositions } from '../db/positions.js';
@@ -198,7 +199,7 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   let atrPercent = null;
   if (useDynamicSl) {
     try {
-      const chart = await fetchJupiterChartContext(position.mint);
+      const chart = await fetchChartContextCached(position.mint);
       const windows = Array.isArray(chart?.windows) ? chart.windows : [];
       atrPercent = computeAtrPercent(windows, numSetting('atr_period', 14));
       effectiveSlPercent = dynamicStopLossPercent({

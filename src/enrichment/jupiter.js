@@ -3,63 +3,166 @@ import { WSOL_MINT, JSON_HEADERS, JUPITER_API_KEY, JUPITER_SWAP_BASE_URL } from 
 import { now, sleep } from '../utils.js';
 
 const jupiterAssetCache = new Map();
-let jupiterAssetBackoffUntil = 0;
+
+// ---- Jupiter HTTP client -------------------------------------------------------
+// Free plan: ONE shared bucket (1 RPS / 60 RPM sliding 60s) covers /order, /quote,
+// /price/v3 and /tokens/v2; /execute has its own 50 RPS bucket; datapi.jup.ag is
+// undocumented so it gets its own best-effort bucket that backs off on 429/403 and
+// lets callers fall back to GMGN. A 429 has no lockout: wait for x-ratelimit-reset.
+// One queue per bucket, always dispatching the highest-priority waiter first.
+const PRIORITY = { exit_live: 0, exit_paper: 1, entry: 2, enrich: 3 };
+const ENRICH_DEADLINE_MS = 20_000;
+const WINDOW_MS = 60_000;
+const DATAPI_BACKOFF_MS = 30_000;
+const envNum = (name, fallback) => {
+  const n = Number(process.env[name]);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+};
+
+const realClock = { now: () => Date.now(), sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) };
+let clock = realClock;
+let buckets = newBuckets();
+
+function newBucket(gapMs, perWindow) {
+  return { gapMs, perWindow, queue: [], pumping: false, nextAt: 0, blockedUntil: 0, stamps: [], count429: 0, seq: 0 };
+}
+
+function newBuckets() {
+  return {
+    main: newBucket(1000 / envNum('JUP_MAIN_RPS', 1), envNum('JUP_MAIN_RPM', 60)),
+    execute: newBucket(0, Infinity),
+    datapi: newBucket(1000 / envNum('JUP_DATAPI_RPS', 2), Infinity),
+  };
+}
+
+// Test hooks: inject a fake clock ({ now, sleep }) and/or reset all limiter state.
+export function _setClock(next) { clock = next || realClock; }
+export function _resetJupiterClient() { clock = realClock; buckets = newBuckets(); }
+
+function resetHeaderMs(headers) {
+  const reset = Number(headers?.['x-ratelimit-reset']);
+  if (!Number.isFinite(reset) || reset <= 0) return 0;
+  return reset > 1_000_000_000_000 ? reset : reset * 1000;
+}
+
+function noteResponse(name, bucket, headers, status) {
+  const resetMs = resetHeaderMs(headers);
+  const remaining = Number(headers?.['x-ratelimit-remaining']);
+  if (status === 429) {
+    bucket.count429 += 1;
+    if (name !== 'datapi') bucket.blockedUntil = Math.max(bucket.blockedUntil, resetMs > clock.now() ? resetMs : clock.now() + 1000);
+  } else if (name === 'main' && Number.isFinite(remaining) && remaining <= 0 && resetMs > clock.now()) {
+    bucket.blockedUntil = Math.max(bucket.blockedUntil, resetMs);
+  }
+  if (name === 'datapi' && (status === 429 || status === 403)) {
+    const until = resetMs > clock.now() ? resetMs : clock.now() + DATAPI_BACKOFF_MS;
+    bucket.blockedUntil = Math.max(bucket.blockedUntil, until);
+    console.log(`[datapi] backing off until ${new Date(bucket.blockedUntil).toISOString()} (${status})`);
+  }
+}
+
+function dispatch(name, bucket, item) {
+  const at = clock.now();
+  bucket.stamps.push(at);
+  if (bucket.stamps.length > 500) bucket.stamps = bucket.stamps.filter(s => at - s < WINDOW_MS);
+  const promise = item.run();
+  promise.then(
+    res => { noteResponse(name, bucket, res?.headers, res?.status || 200); item.resolve(res); },
+    err => { noteResponse(name, bucket, err?.response?.headers, err?.response?.status); item.reject(err); },
+  );
+}
+
+function rejectWith(item, code, message) {
+  const err = new Error(message);
+  err.code = code;
+  item.reject(err);
+}
+
+async function pump(name, bucket) {
+  if (bucket.pumping) return;
+  bucket.pumping = true;
+  try {
+    while (bucket.queue.length) {
+      const t = clock.now();
+      bucket.stamps = bucket.stamps.filter(s => t - s < WINDOW_MS);
+      for (const item of bucket.queue.filter(q => q.deadlineAt && q.deadlineAt <= t)) {
+        bucket.queue.splice(bucket.queue.indexOf(item), 1);
+        rejectWith(item, 'JUP_DEADLINE', `jupiter ${name} queue deadline exceeded (${item.priority})`);
+      }
+      if (!bucket.queue.length) break;
+      if (name === 'datapi' && t < bucket.blockedUntil) {
+        for (const item of bucket.queue.splice(0)) rejectWith(item, 'JUP_BACKOFF', 'jupiter datapi backoff active');
+        break;
+      }
+      let readyAt = Math.max(bucket.nextAt, bucket.blockedUntil);
+      if (bucket.stamps.length >= bucket.perWindow) readyAt = Math.max(readyAt, bucket.stamps[0] + WINDOW_MS);
+      if (readyAt > t) {
+        // Sleep no longer than the nearest enrich deadline so it can reject on time.
+        const deadlines = bucket.queue.map(q => q.deadlineAt).filter(Boolean);
+        const wakeAt = Math.min(readyAt, ...deadlines);
+        await clock.sleep(Math.max(1, wakeAt - t));
+        continue;
+      }
+      let best = 0;
+      for (let i = 1; i < bucket.queue.length; i++) {
+        const a = bucket.queue[i];
+        const b = bucket.queue[best];
+        if (a.rank < b.rank || (a.rank === b.rank && a.seq < b.seq)) best = i;
+      }
+      const [item] = bucket.queue.splice(best, 1);
+      bucket.nextAt = clock.now() + bucket.gapMs;
+      dispatch(name, bucket, item);
+    }
+  } finally {
+    bucket.pumping = false;
+  }
+}
+
+export function jupiterFetch(url, { method = 'GET', body, priority = 'enrich', bucket: bucketName = 'main', timeoutMs = 10_000, deadlineMs } = {}) {
+  const bucket = buckets[bucketName];
+  if (!bucket) return Promise.reject(new Error(`unknown jupiter bucket ${bucketName}`));
+  const headers = { ...JSON_HEADERS };
+  if (bucketName !== 'datapi' && JUPITER_API_KEY) headers['x-api-key'] = JUPITER_API_KEY;
+  const run = () => (String(method).toUpperCase() === 'POST'
+    ? axios.post(url, body, { timeout: timeoutMs, headers: { ...headers, 'content-type': 'application/json' } })
+    : axios.get(url, { timeout: timeoutMs, headers }));
+  const rank = PRIORITY[priority] ?? PRIORITY.enrich;
+  const effectiveDeadline = deadlineMs ?? (priority === 'enrich' && bucketName !== 'execute' ? ENRICH_DEADLINE_MS : null);
+  return new Promise((resolve, reject) => {
+    const item = { run, resolve, reject, priority, rank, seq: bucket.seq++, deadlineAt: effectiveDeadline ? clock.now() + effectiveDeadline : 0 };
+    if (bucketName === 'execute') { dispatch(bucketName, bucket, item); return; }
+    bucket.queue.push(item);
+    pump(bucketName, bucket);
+  });
+}
+
+export function jupiterUsageStats() {
+  const t = clock.now();
+  const out = {};
+  for (const [name, bucket] of Object.entries(buckets)) {
+    out[name] = {
+      requestsLast60s: bucket.stamps.filter(s => t - s < WINDOW_MS).length,
+      count429: bucket.count429,
+      queued: bucket.queue.length,
+    };
+  }
+  out.datapi.backoffActive = t < buckets.datapi.blockedUntil;
+  out.datapi.backoffUntil = buckets.datapi.blockedUntil || null;
+  return out;
+}
 
 function jupiterAssetBackoffActive() {
-  return now() < jupiterAssetBackoffUntil;
+  return clock.now() < buckets.datapi.blockedUntil;
 }
 
+// Kept for compatibility: manually trip the datapi backoff from a caught error.
 function setJupiterAssetBackoff(err) {
-  if (err.response?.status !== 429) return;
-  const resetHeader = Number(err.response?.headers?.['x-ratelimit-reset'] || 0);
-  const resetMs = resetHeader > 1_000_000_000_000 ? resetHeader : resetHeader * 1000;
-  jupiterAssetBackoffUntil = resetMs > now() ? resetMs : now() + 30_000;
-  console.log(`[asset] backing off until ${new Date(jupiterAssetBackoffUntil).toISOString()} (429)`);
+  const status = err?.response?.status;
+  if (status === 429 || status === 403) noteResponse('datapi', buckets.datapi, err.response.headers, status);
 }
 
-let quoteBackoffUntil = 0;
 const quoteSnapshotCache = new Map();
 const QUOTE_SNAPSHOT_MS = 10_000;
-// The keyed quote plan is small (x-ratelimit-current: 10). Bursts — 2 quotes per
-// position tick plus 3 retries per entry — hit 429 instantly, so requests are paced
-// instead of fired in parallel.
-const QUOTE_MIN_GAP_MS = 130;
-let quoteNextSlot = 0;
-
-// Measured 2026-10-23 with the live key: the bucket is 10 requests per SECOND
-// (x-ratelimit-reset ticks every second, x-ratelimit-current saturates at 10).
-// Blind 130ms pacing still burst past it whenever candidates, entries and 5
-// monitored positions collided, so the budget is now read from the headers:
-// when the current window is nearly spent, the next slot is pushed to the reset
-// boundary instead of guessing.
-function noteQuoteBudget(headers) {
-  const remaining = Number(headers?.['x-ratelimit-remaining']);
-  const reset = Number(headers?.['x-ratelimit-reset']);
-  if (!Number.isFinite(remaining) || !Number.isFinite(reset) || reset <= 0) return;
-  const resetMs = reset > 1_000_000_000_000 ? reset : reset * 1000;
-  if (remaining <= 1) quoteNextSlot = Math.max(quoteNextSlot, resetMs + 25);
-}
-
-async function quoteSlot() {
-  const at = Date.now();
-  const slot = Math.max(at, quoteNextSlot);
-  quoteNextSlot = slot + QUOTE_MIN_GAP_MS;
-  if (slot > at) await sleep(slot - at);
-}
-
-function quoteBackoffActive() {
-  return now() < quoteBackoffUntil;
-}
-
-function setQuoteBackoff(err) {
-  if (err.response?.status !== 429) return;
-  const resetHeader = Number(err.response?.headers?.['x-ratelimit-reset'] || 0);
-  const resetMs = resetHeader > 1_000_000_000_000 ? resetHeader : resetHeader * 1000;
-  // 30s used to black out EVERY quote (measured 28.6% of the day dead) which froze
-  // position monitoring; cap the wait so a single 429 costs one tick, not 10.
-  quoteBackoffUntil = now() + Math.min(Math.max(resetMs - now(), 1_000), 10_000);
-  console.log(`[quote] backing off until ${new Date(quoteBackoffUntil).toISOString()} (429)`);
-}
 
 let solUsdCache = { price: null, at: 0 };
 
@@ -101,39 +204,31 @@ function normalizeJupiterTrendingRow(row, interval, rank) {
   };
 }
 
-async function fetchJupiterAsset(mint, { useCache = true, ttlMs = 20_000 } = {}) {
+async function fetchJupiterAsset(mint, { useCache = true, ttlMs = 20_000, priority = 'enrich' } = {}) {
   const cached = jupiterAssetCache.get(mint);
   if (useCache && cached && now() - cached.at < ttlMs) return cached.data;
   if (jupiterAssetBackoffActive()) return useCache ? cached?.data || null : null;
   try {
     const url = new URL('https://datapi.jup.ag/v1/assets/search');
     url.searchParams.set('query', mint);
-    const res = await axios.get(url.toString(), {
-      timeout: 10_000,
-      headers: JSON_HEADERS,
-    });
+    const res = await jupiterFetch(url.toString(), { bucket: 'datapi', priority });
     const rows = Array.isArray(res.data) ? res.data : [];
     const data = rows.find(row => row?.id === mint) || null;
     jupiterAssetCache.set(mint, { at: now(), data });
     return data;
   } catch (err) {
-    setJupiterAssetBackoff(err);
-    if (err.response?.status !== 429) console.log(`[asset] ${mint.slice(0, 8)}... ${err.response?.status || ''} ${err.message}`);
+    if (err.response?.status !== 429 && err.code !== 'JUP_BACKOFF') console.log(`[asset] ${mint.slice(0, 8)}... ${err.response?.status || ''} ${err.message}`);
     return useCache ? cached?.data || null : null;
   }
 }
 
 async function fetchSolUsdPrice() {
-  const keyed = JUPITER_API_KEY
-    ? { ...JSON_HEADERS, 'x-api-key': JUPITER_API_KEY }
-    : JSON_HEADERS;
   const hosts = JUPITER_API_KEY
     ? ['https://api.jup.ag', 'https://lite-api.jup.ag']
     : ['https://lite-api.jup.ag'];
   for (const host of hosts) {
     try {
-      await quoteSlot();
-      const res = await axios.get(`${host}/price/v3?ids=${WSOL_MINT}`, { timeout: 5000, headers: keyed });
+      const res = await jupiterFetch(`${host}/price/v3?ids=${WSOL_MINT}`, { priority: 'entry', timeoutMs: 5000 });
       const price = Number(res.data?.[WSOL_MINT]?.usdPrice);
       if (Number.isFinite(price) && price > 0) return price;
     } catch (err) {
@@ -152,10 +247,7 @@ async function estimateTokenAmountFromSol(sizeSol, entryPrice) {
 
 async function fetchJupiterHolders(mint) {
   try {
-    const res = await axios.get(`https://datapi.jup.ag/v1/holders/${mint}`, {
-      timeout: 10_000,
-      headers: JSON_HEADERS,
-    });
+    const res = await jupiterFetch(`https://datapi.jup.ag/v1/holders/${mint}`, { bucket: 'datapi' });
     const holders = Array.isArray(res.data?.holders) ? res.data.holders : [];
     const total = holders.reduce((sum, holder) => sum + Number(holder.amount || 0), 0);
     const mapped = holders.map((holder, index) => {
@@ -215,10 +307,7 @@ async function fetchJupiterChartWindow(mint, interval, candles, label) {
   url.searchParams.set('candles', String(candles));
   url.searchParams.set('type', 'price');
   url.searchParams.set('quote', 'native');
-  const res = await axios.get(url.toString(), {
-    timeout: 10_000,
-    headers: JSON_HEADERS,
-  });
+  const res = await jupiterFetch(url.toString(), { bucket: 'datapi' });
   return summarizeCandles(label, Array.isArray(res.data?.candles) ? res.data.candles : []);
 }
 
@@ -277,41 +366,26 @@ async function fetchSolUsdPriceCached() {
   return null;
 }
 
-async function jupiterQuoteOnce(params, label) {
-  if (quoteBackoffActive()) return null;
+async function jupiterQuoteOnce(params, label, priority) {
   try {
-    await quoteSlot();
     const url = new URL(`${JUPITER_SWAP_BASE_URL}/quote`);
     for (const [key, value] of Object.entries(params)) url.searchParams.set(key, String(value));
-    // The keyed endpoint has a higher tier; the old hardcoded lite-api host was
-    // unauthenticated and sat at ~1 req/s, so monitoring was permanently 429'd.
-    const headers = JUPITER_API_KEY ? { ...JSON_HEADERS, 'x-api-key': JUPITER_API_KEY } : JSON_HEADERS;
-    const res = await axios.get(url.toString(), { timeout: 10_000, headers });
-    noteQuoteBudget(res.headers);
+    const res = await jupiterFetch(url.toString(), { priority });
     return res.data?.outAmount ? { ...res.data, observedAtMs: now() } : null;
   } catch (err) {
-    noteQuoteBudget(err.response?.headers);
-    setQuoteBackoff(err);
     if (err.response?.status !== 429) console.log(`[quote] ${label} ${err.response?.status || ''} ${err.message}`);
     return null;
   }
 }
 
 // A freshly migrated mint often has no route for a few hundred ms — retry instead of
-// dropping the entry (retries skip 429s, which are handled by the backoff).
-// `waitOutBackoff` is for entries only: dropping a signal because the previous 429
-// still has 4s left on its timer was rejecting 140 candidates a day for a wait that
-// costs nothing (positions are monitored on a 10s tick and never wait).
-async function jupiterQuote(params, label, attempts = 3, { waitOutBackoff = false } = {}) {
+// dropping the entry. Rate limiting (429 -> wait for x-ratelimit-reset) is handled by
+// the shared queue in jupiterFetch, so a retry simply queues behind the reset.
+// `waitOutBackoff` is accepted for compatibility; the queue always waits.
+async function jupiterQuote(params, label, attempts = 3, { priority = 'entry' } = {}) {
   for (let i = 0; i < attempts; i++) {
-    const quote = await jupiterQuoteOnce(params, label);
+    const quote = await jupiterQuoteOnce(params, label, priority);
     if (quote) return quote;
-    if (quoteBackoffActive()) {
-      if (!waitOutBackoff) return null;
-      const waitMs = Math.min(quoteBackoffUntil - now() + 50, 10_000);
-      if (waitMs > 0) await sleep(waitMs);
-      continue;
-    }
     await sleep(350);
   }
   return null;
@@ -320,20 +394,19 @@ async function jupiterQuote(params, label, attempts = 3, { waitOutBackoff = fals
 // Fixed 1000-token reference amount ignores price impact for large sizes —
 // upgrade to position-sized quotes when size_sol > 1.
 export async function fetchJupiterExecutionQuote({ inputMint, outputMint, amount }, opts = undefined) {
-  return jupiterQuote({ inputMint, outputMint, amount, slippageBps: 100 }, 'execution', 3, opts);
+  return jupiterQuote({ inputMint, outputMint, amount, slippageBps: 100 }, 'execution', 3, { priority: opts?.priority || 'entry' });
 }
 
-async function fetchTokenSpotViaQuote(mint, decimals = 9) {
+async function fetchTokenSpotViaQuote(mint, decimals = 9, { priority = 'entry' } = {}) {
   const normalizedDecimals = Number.isFinite(Number(decimals)) ? Math.max(0, Math.min(18, Number(decimals))) : 9;
   const cacheKey = `${mint}:${normalizedDecimals}`;
   const cached = quoteSnapshotCache.get(cacheKey);
   if (cached && now() - cached.at < QUOTE_SNAPSHOT_MS) return cached.priceUsd;
-  if (quoteBackoffActive()) return null;
   try {
     const tokenUnits = 1000 * (10 ** normalizedDecimals);
     const [solUsd, quoteRes] = await Promise.all([
       fetchSolUsdPriceCached(),
-      jupiterQuote({ inputMint: mint, outputMint: WSOL_MINT, amount: Math.round(tokenUnits), slippageBps: 100 }, mint.slice(0, 8), 2),
+      jupiterQuote({ inputMint: mint, outputMint: WSOL_MINT, amount: Math.round(tokenUnits), slippageBps: 100 }, mint.slice(0, 8), 2, { priority }),
     ]);
     const outAmount = quoteRes?.outAmount;
     if (!outAmount) return null;
@@ -343,7 +416,6 @@ async function fetchTokenSpotViaQuote(mint, decimals = 9) {
     quoteSnapshotCache.set(cacheKey, { at: now(), priceUsd });
     return priceUsd;
   } catch (err) {
-    setQuoteBackoff(err);
     if (err.response?.status !== 429) console.log(`[quote] ${mint.slice(0, 8)}... ${err.response?.status || ''} ${err.message}`);
     return null;
   }
@@ -354,7 +426,7 @@ async function fetchJupiterWalletPnl(walletAddress) {
     const url = new URL('https://datapi.jup.ag/v1/pnl');
     url.searchParams.set('addresses', walletAddress);
     url.searchParams.set('includeClosed', 'false');
-    const res = await axios.get(url.toString(), { timeout: 10_000, headers: JSON_HEADERS });
+    const res = await jupiterFetch(url.toString(), { bucket: 'datapi' });
     const data = res.data?.[walletAddress] || {};
     for (const mint of IGNORED_PNL_MINTS) delete data[mint];
     return data;
