@@ -1,5 +1,8 @@
 // Charon paper execution v2. Quotes already include pool/route fees.
 export const PAPER_VERSION = 'quote-paper-2.0';
+// Paper wallet cost model: flat fee per leg, ATA rent locked at entry and refunded at close.
+export const PAPER_FEE_LAMPORTS = 15000;
+export const PAPER_ATA_RENT_LAMPORTS = 2039280;
 export const WSOL = 'So11111111111111111111111111111111111111112';
 export function integer(value) {
   const s = String(value ?? '');
@@ -42,7 +45,7 @@ export async function delayedQuote(request, fetchQuote, { reference, wait = ms =
   }
   return { reference: first, fill };
 }
-export function paperPnl(entryLamports, proceedsLamports, entryFee = '15000', exitFee = '15000') {
+export function paperPnl(entryLamports, proceedsLamports, entryFee = PAPER_FEE_LAMPORTS, exitFee = PAPER_FEE_LAMPORTS) {
   const entry = integer(entryLamports), proceeds = integer(proceedsLamports);
   if (entry <= 0n) throw new Error('invalid_entry');
   const net = proceeds - entry - integer(entryFee) - integer(exitFee);

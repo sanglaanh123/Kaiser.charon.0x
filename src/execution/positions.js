@@ -1,4 +1,4 @@
-import { delayedQuote, validQuote, paperPnl, PAPER_VERSION } from './paperSafety.js';
+import { delayedQuote, validQuote, paperPnl, PAPER_VERSION, PAPER_FEE_LAMPORTS } from './paperSafety.js';
 import { paperAudit } from '../db/paperAudit.js';
 import { now, json } from '../utils.js';
 import { numSetting, boolSetting, strategyById, slippageAdjustedMcap } from '../db/settings.js';
@@ -132,7 +132,7 @@ export async function refreshCandidateForExecution(row) {
 
 const sellInProgress = new Set();
 
-const PAPER_ROUNDTRIP_FEE_SOL = 30000 / 1e9; // matches paperPnl's 15000 + 15000 lamports
+const PAPER_ROUNDTRIP_FEE_SOL = 2 * PAPER_FEE_LAMPORTS / 1e9; // matches paperPnl's entry + exit fee
 const bigOf = (v) => /^\d+$/.test(String(v)) ? BigInt(String(v)) : BigInt(Math.floor(Number(v) || 0));
 // Portion of an integer amount (percent may be fractional, 0.01% resolution).
 const portion = (amount, percent) => bigOf(amount) * BigInt(Math.round(Number(percent) * 100)) / 10000n;
@@ -411,11 +411,15 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
     // A stop that cannot find a quote must still close: mark-fill it and keep the
     // evidence labelled, otherwise the loss runs unmonitored until quotes return.
     const net = execution ? paperNet(paperSnapshot.entryLamports, execution.fill.outAmount, realizedPartial) : null;
-    const dryPnlPercent = net ? net.pnlPercent : pnlPercent, dryPnlSol = net ? net.pnlSol : pnlSol;
+    // Mark-based PnL (no valid quote this tick) carries no fees; charge the paper roundtrip
+    // so the paper wallet never ends up richer than a live wallet would.
+    const markFeeSol = !net && !quoteValid ? PAPER_ROUNDTRIP_FEE_SOL : 0;
+    const dryPnlSol = net ? net.pnlSol : pnlSol - markFeeSol;
+    const dryPnlPercent = net ? net.pnlPercent : (Number(position.size_sol) > 0 ? dryPnlSol / Number(position.size_sol) * 100 : pnlPercent);
     const dryExitMcap = net ? Number(position.entry_mcap) * (1 + dryPnlPercent / 100) : mcap;
     const dryExitPrice = net && !position.partial_tp_done ? Number(position.entry_price) * Number(execution.fill.outAmount) / Number(paperSnapshot.entryLamports) : price;
     const evidence = net
-      ? { paperVersion: PAPER_VERSION, pnlPercent: dryPnlPercent, pnlSol: dryPnlSol, ...net, entryLamports: paperSnapshot.entryLamports, proceedsLamports: execution.fill.outAmount, realizedPartialSol: realizedPartial, assumedNetworkFeeLamports: '5000', assumedPriorityFeeLamports: '10000', referenceQuote: execution.reference, exitQuote: execution.fill }
+      ? { paperVersion: PAPER_VERSION, pnlPercent: dryPnlPercent, pnlSol: dryPnlSol, ...net, entryLamports: paperSnapshot.entryLamports, proceedsLamports: execution.fill.outAmount, realizedPartialSol: realizedPartial, paperFeeLamportsPerLeg: String(PAPER_FEE_LAMPORTS), referenceQuote: execution.reference, exitQuote: execution.fill }
       : { paperVersion: `${PAPER_VERSION}+mark-fallback`, pnlPercent: dryPnlPercent, pnlSol: dryPnlSol, exitMarkPrice: price, exitMarkMcap: mcap, reason: 'quote_unavailable' };
     const closedNow = db.transaction(() => {
       const changed = db.prepare(`UPDATE dry_run_positions SET status='closed',closed_at_ms=?,exit_price=?,exit_mcap=?,exit_reason=?,pnl_percent=?,pnl_sol=? WHERE id=? AND status='open'`).run(now(), dryExitPrice, dryExitMcap, exitReason, dryPnlPercent, dryPnlSol, position.id).changes;

@@ -32,6 +32,7 @@ const EXPECTED_ENTRY_REJECTIONS = new Set([
   'missing_token_decimals',
   'missing_sol_usd_price',
   'paper_mode_or_position_limit_changed',
+  'paper_insufficient_balance',
 ]);
 
 setCandidateHandler(processCandidateFromSignals);

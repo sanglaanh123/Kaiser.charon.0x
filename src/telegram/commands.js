@@ -30,6 +30,8 @@ import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
 import { sendDailyReport } from './dailyReport.js';
 import { jupiterUsageStats } from '../enrichment/jupiter.js';
+import { paperWalletState, resetPaperWallet } from '../db/paperWallet.js';
+import { tradingMode } from '../db/positions.js';
 
 export async function handleMessage(msg) {
   const text = (msg.text || '').trim();
@@ -107,6 +109,18 @@ export async function handleMessage(msg) {
     return bot.sendMessage(chatId, `Removed ${label}.`);
   }
   if (text.startsWith('/wallets')) return handleCallback({ id: 'manual', data: 'menu:wallets', message: { chat: { id: chatId } } });
+  if (text.startsWith('/paper_reset')) {
+    const arg = text.trim().split(/\s+/)[1];
+    const startSol = arg === undefined ? undefined : Number(arg);
+    if (startSol !== undefined && !(Number.isFinite(startSol) && startSol > 0)) return bot.sendMessage(chatId, 'Usage: /paper_reset [sol] (sol must be > 0)');
+    try {
+      resetPaperWallet({ startSol });
+      return bot.sendMessage(chatId, `Paper wallet reset. ${paperWalletLine()}`);
+    } catch (err) {
+      if (err.message === 'paper_reset_open_positions') return bot.sendMessage(chatId, 'Cannot reset: close all open paper positions first.');
+      return bot.sendMessage(chatId, `Reset failed: ${err.message}`);
+    }
+  }
   if (text.startsWith('/setfilter')) {
     const { key, value } = parseSetFilter(text);
     const valid = new Set([
@@ -263,6 +277,7 @@ export function setupTelegram() {
     { command: 'learn', description: 'Run manual learning report' },
     { command: 'lessons', description: 'Show active screening lessons' },
     { command: 'setfilter', description: 'Set a filter value' },
+    { command: 'paper_reset', description: 'Reset paper wallet (paper_reset [sol])' },
     { command: 'walletadd', description: 'Save wallet for exposure/PnL' },
     { command: 'walletremove', description: 'Remove saved wallet' },
     { command: 'wallets', description: 'List saved wallets' },
@@ -312,10 +327,17 @@ function jupiterStatusLine() {
   return `Jupiter: main ${u.main.requestsLast60s}/${limit} req/60s, 429s ${u.main.count429 + u.datapi.count429}, datapi ${datapi}, queued main ${u.main.queued} / datapi ${u.datapi.queued}`;
 }
 
+function paperWalletLine() {
+  const w = paperWalletState();
+  return `Paper wallet: ${w.balanceSol.toFixed(4)} SOL, available ${w.availableSol.toFixed(4)}, locked ${w.lockedSol.toFixed(4)}, open ${w.openCount}, realized ${w.realizedSol.toFixed(4)} since reset`;
+}
+
 async function sendStatus(chatId) {
   const mode = setting('trading_mode', 'dry_run');
   const open = db.prepare("SELECT COUNT(*) AS n FROM dry_run_positions WHERE status = 'open'").get().n;
-  const lines = [`Mode: ${mode}`, `Open positions: ${open}`, jupiterStatusLine()];
+  const lines = [`Mode: ${mode}`, `Open positions: ${open}`];
+  if (tradingMode() === 'dry_run') lines.push(paperWalletLine());
+  lines.push(jupiterStatusLine());
   return bot.sendMessage(chatId, lines.map(escapeHtml).join('\n'), { parse_mode: 'HTML' });
 }
 

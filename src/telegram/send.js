@@ -4,6 +4,7 @@ import { now, json } from '../utils.js';
 import { db } from '../db/connection.js';
 import { escapeHtml, fmtPct, fmtSol, fmtUsd, short, gmgnLink } from '../format.js';
 import { numSetting } from '../db/settings.js';
+import { paperWalletState } from '../db/paperWallet.js';
 import { candidateSummary, compactCandidateLine, batchRevealSummary, formatPosition } from './format.js';
 import { candidateButtons, batchRevealButtons, positionButtons, intentButtons } from './menus.js';
 import { batchById } from '../db/decisions.js';
@@ -73,7 +74,11 @@ export async function sendPositionOpen(positionId) {
   const position = db.prepare('SELECT * FROM dry_run_positions WHERE id = ?').get(positionId);
   if (!position) return;
   const label = position.execution_mode === 'live' ? 'Live buy executed' : 'Dry-run buy stored';
-  const text = `✅ <b>${label}</b>\n\n${formatPosition(position)}`;
+  let walletLine = '';
+  if (position.execution_mode !== 'live') {
+    try { const w = paperWalletState(); walletLine = `\nPaper balance: ${w.balanceSol.toFixed(4)} SOL (available ${w.availableSol.toFixed(4)})`; } catch {}
+  }
+  const text = `✅ <b>${label}</b>\n\n${formatPosition(position)}${walletLine}`;
   let photoSent = false;
   let sent;
   try {

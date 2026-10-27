@@ -1,4 +1,5 @@
-import { delayedQuote, PAPER_VERSION } from '../execution/paperSafety.js';
+import { delayedQuote, PAPER_VERSION, PAPER_FEE_LAMPORTS } from '../execution/paperSafety.js';
+import { paperEntryCheck } from './paperWallet.js';
 import { paperAudit } from './paperAudit.js';
 import { db } from './connection.js';
 import { now, json } from '../utils.js';
@@ -114,8 +115,10 @@ export async function createDryRunPosition(candidateId, candidate, decision, rea
   const trailingEnabled = (strat.trailing_enabled ?? boolSetting('default_trailing_enabled', true)) ? 1 : 0;
   const trailingPercent = strat.trailing_percent ?? numSetting('default_trailing_percent', 20);
 
-  return db.transaction(() => {
+  const placed = db.transaction(() => {
     if (tradingMode() !== 'dry_run' || !canOpenMorePositions()) throw new Error('paper_mode_or_position_limit_changed');
+    const wallet = paperEntryCheck(sizeSol);
+    if (!wallet.ok) return { rejected: wallet }; // audit outside the txn so it survives
     const blocked = entryBlockReason(candidate.token.mint);
     if (blocked) {
       if (blocked.reason === 'open_position') return { id: blocked.id, isNew: false };
@@ -147,7 +150,7 @@ export async function createDryRunPosition(candidateId, candidate, decision, rea
       trailingPercent,
       decision.id || null,
       strat.id,
-      json({ candidate, decision, reason, strategy: strat.id, strategyConfig: strat, paperVersion: PAPER_VERSION, entryLamports: String(amountLamports), tokenAmountRaw, assumedNetworkFeeLamports: '5000', assumedPriorityFeeLamports: '10000', rentAccounting: 'not_modeled_use_office_for_capital_test', entryQuote, referenceQuote }),
+      json({ candidate, decision, reason, strategy: strat.id, strategyConfig: strat, paperVersion: PAPER_VERSION, entryLamports: String(amountLamports), tokenAmountRaw, paperFeeLamportsPerLeg: String(PAPER_FEE_LAMPORTS), rentAccounting: 'ata_rent_locked_until_close', entryQuote, referenceQuote }),
     );
     const positionId = Number(result.lastInsertRowid);
     db.prepare(`
@@ -161,6 +164,11 @@ export async function createDryRunPosition(candidateId, candidate, decision, rea
     paperAudit(candidate.token.mint, 'entry_filled', { positionId, candidateId, entryLamports: String(amountLamports), tokenAmountRaw, entryQuote, referenceQuote });
     return { id: positionId, isNew: true };
   })();
+  if (placed.rejected) {
+    paperAudit(candidate.token.mint, 'entry_rejected', { reason: 'paper_insufficient_balance', availableSol: placed.rejected.availableSol, needSol: placed.rejected.needSol, candidateId });
+    throw new Error('paper_insufficient_balance');
+  }
+  return placed;
 }
 
 // Fill-based entry price (USD per token) from the executed swap; null if any input is missing.
