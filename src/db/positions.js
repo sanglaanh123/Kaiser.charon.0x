@@ -5,6 +5,7 @@ import { now, json } from '../utils.js';
 import { numSetting, boolSetting, setting, activeStrategy, slippageAdjustedMcap } from './settings.js';
 import { fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { WSOL_MINT } from '../config.js';
+import { getCachedDecimals } from '../enrichment/market.js';
 
 export function openPositions() {
   return db.prepare('SELECT * FROM dry_run_positions WHERE status = ? ORDER BY opened_at_ms DESC').all('open');
@@ -37,22 +38,49 @@ export function allPositions(limit = 10) {
   return db.prepare('SELECT * FROM dry_run_positions ORDER BY id DESC LIMIT ?').all(limit);
 }
 
-export async function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
-  const strat = activeStrategy();
+export const WIN_BLOCK_DAYS = 7;
+
+// Shared entry gate (paper + live): null, or { reason, id, ... } when a new entry on this mint must be blocked.
+export function entryBlockReason(mint) {
+  const open = db.prepare(`SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1`).get(mint);
+  if (open) return { reason: 'open_position', id: open.id };
+  const recent = db.prepare(`
+    SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? LIMIT 1
+  `).get(mint, now() - 86400000);
+  if (recent) return { reason: 'recently_closed', id: recent.id };
+  const win = db.prepare(`
+    SELECT id, pnl_sol, closed_at_ms FROM dry_run_positions
+    WHERE mint = ? AND status = 'closed' AND pnl_percent > 0 AND closed_at_ms > ?
+    ORDER BY closed_at_ms DESC LIMIT 1
+  `).get(mint, now() - WIN_BLOCK_DAYS * 86400000);
+  if (win) return { reason: 'past_win', id: win.id, pnlSol: win.pnl_sol, closedAtMs: win.closed_at_ms };
+  return null;
+}
+
+// Entry size after risk-severity halving; shared by paper, live buy, live record and failed-entry rows.
+export function positionSizeSol(candidate, strat = activeStrategy()) {
   let sizeSol = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
-  
-  // OPTION C HYBRID: Risk-based position sizing
-  // Calculate total risk severity from candidate.riskFlags
-  const riskFlags = candidate.riskFlags || [];
+  const riskFlags = candidate?.riskFlags || [];
   const totalRiskSeverity = riskFlags.reduce((sum, flag) => sum + (flag.severity || 0), 0);
-  
   if (totalRiskSeverity >= 2) {
-    // High risk (severity ≥2) → cut size to 50%
+    // High risk (severity >=2) -> cut size to 50%
     const originalSize = sizeSol;
     sizeSol *= 0.5;
-    console.log(`[position] risk-adjusted size: ${originalSize} → ${sizeSol} SOL (total risk severity: ${totalRiskSeverity}, flags: ${riskFlags.map(f => f.type).join(', ')})`);
+    console.log(`[position] risk-adjusted size: ${originalSize} -> ${sizeSol} SOL (total risk severity: ${totalRiskSeverity}, flags: ${riskFlags.map(f => f.type).join(', ')})`);
   }
-  
+  return sizeSol;
+}
+
+// Pure valuation: remaining-position proceeds plus banked partial proceeds vs cost.
+export function positionValue({ remainingProceedsSol, realizedPartialSol = 0, sizeSol, feesSol = 0 }) {
+  const size = Number(sizeSol);
+  const pnlSol = Number(remainingProceedsSol || 0) + Number(realizedPartialSol || 0) - size - Number(feesSol || 0);
+  return { pnlSol, pnlPercent: size > 0 ? pnlSol / size * 100 : 0 };
+}
+
+export async function createDryRunPosition(candidateId, candidate, decision, reason = 'llm_buy') {
+  const strat = activeStrategy();
+  const sizeSol = positionSizeSol(candidate, strat);
   const amountLamports = Math.floor(sizeSol * 1_000_000_000);
   let entryQuote, referenceQuote;
   const entryQuoteRequest = { inputMint: WSOL_MINT, outputMint: candidate.token.mint, amount: amountLamports };
@@ -88,31 +116,12 @@ export async function createDryRunPosition(candidateId, candidate, decision, rea
 
   return db.transaction(() => {
     if (tradingMode() !== 'dry_run' || !canOpenMorePositions()) throw new Error('paper_mode_or_position_limit_changed');
-    const existing = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1
-    `).get(candidate.token.mint);
-    if (existing) return { id: existing.id, isNew: false };
-
-    // Dedup: block re-entry if this token has been closed within 24 hours
-    const recentClosed = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? LIMIT 1
-    `).get(candidate.token.mint, now() - 86400000);
-    if (recentClosed) {
-      console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — closed <24h ago`);
-      return { id: recentClosed.id, isNew: false };
-    }
-
-    // Block re-entry if this mint had a winning trade in the last WIN_BLOCK_DAYS days (avoid round-trip losses)
-    const WIN_BLOCK_DAYS = 7;
-    const pastWin = db.prepare(`
-      SELECT id, pnl_sol, closed_at_ms FROM dry_run_positions
-      WHERE mint = ? AND status = 'closed' AND pnl_percent > 0
-        AND closed_at_ms > ?
-      ORDER BY closed_at_ms DESC LIMIT 1
-    `).get(candidate.token.mint, now() - WIN_BLOCK_DAYS * 86400000);
-    if (pastWin) {
-      console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — past WIN exists`);
-      return { id: pastWin.id, isNew: false, blockedBy: 'past_win', pastWinPnlSol: pastWin.pnl_sol, pastWinClosedAtMs: pastWin.closed_at_ms };
+    const blocked = entryBlockReason(candidate.token.mint);
+    if (blocked) {
+      if (blocked.reason === 'open_position') return { id: blocked.id, isNew: false };
+      console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — ${blocked.reason}`);
+      if (blocked.reason === 'past_win') return { id: blocked.id, isNew: false, blockedBy: 'past_win', pastWinPnlSol: blocked.pnlSol, pastWinClosedAtMs: blocked.closedAtMs };
+      return { id: blocked.id, isNew: false };
     }
 
     const result = db.prepare(`
@@ -154,39 +163,38 @@ export async function createDryRunPosition(candidateId, candidate, decision, rea
   })();
 }
 
-export function createLivePosition(candidateId, candidate, decision, swap, reason = 'live_buy') {
+// Fill-based entry price (USD per token) from the executed swap; null if any input is missing.
+async function liveFillPrice(candidate, swap) {
+  try {
+    const lamports = Number(swap?.inputAmount);
+    const raw = Number(swap?.outputAmount);
+    if (!(lamports > 0) || !(raw > 0)) return null;
+    const decimals = Number(candidate.jupiterAsset?.decimals ?? candidate.metrics?.decimals ?? getCachedDecimals(candidate.token.mint));
+    if (!Number.isInteger(decimals) || decimals < 0 || decimals > 18) return null;
+    const solUsd = Number(await fetchSolUsdPriceCached());
+    if (!(solUsd > 0)) return null;
+    const price = (lamports / 1e9 * solUsd) / (raw / (10 ** decimals));
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch { return null; }
+}
+
+// Called only after a FILLED swap: always inserts an open row (tokens are already in the wallet).
+export async function createLivePosition(candidateId, candidate, decision, swap, reason = 'live_buy') {
   const strat = activeStrategy();
-  const sizeSol = strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1);
-  const entryPrice = Number(candidate.metrics.priceUsd || 0) || null;
-  const entryMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;
+  const sizeSol = positionSizeSol(candidate, strat);
+  const signalPrice = Number(candidate.metrics.priceUsd || 0) || null;
+  const signalMcap = Number(candidate.metrics.marketCapUsd || candidate.metrics.graduatedMarketCapUsd || 0) || null;
+  const fillPrice = await liveFillPrice(candidate, swap);
+  const entryPrice = fillPrice ?? signalPrice;
+  const entryMcap = fillPrice && signalPrice && signalMcap ? signalMcap * (fillPrice / signalPrice) : signalMcap;
   const tp = Number(decision.suggested_tp_percent || strat.tp_percent || numSetting('default_tp_percent', 50));
   const sl = Number(decision.suggested_sl_percent || strat.sl_percent || numSetting('default_sl_percent', -25));
   const trailingEnabled = (strat.trailing_enabled ?? boolSetting('default_trailing_enabled', true)) ? 1 : 0;
   const trailingPercent = strat.trailing_percent ?? numSetting('default_trailing_percent', 20);
 
   return db.transaction(() => {
-    const existing = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'open' LIMIT 1
-    `).get(candidate.token.mint);
-    if (existing) return { id: existing.id, isNew: false };
-
-    // Dedup: block re-entry if this token has been closed within 24 hours
-    const recentClosed = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND closed_at_ms > ? LIMIT 1
-    `).get(candidate.token.mint, now() - 86400000);
-    if (recentClosed) {
-      console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — closed <24h ago (live)`);
-      return { id: recentClosed.id, isNew: false };
-    }
-
-    // Block re-entry if this mint ever had a winning trade (avoid round-trip losses)
-    const pastWin = db.prepare(`
-      SELECT id FROM dry_run_positions WHERE mint = ? AND status = 'closed' AND pnl_percent > 0 LIMIT 1
-    `).get(candidate.token.mint);
-    if (pastWin) {
-      console.log(`[positions] blocked re-entry ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — past WIN exists (live)`);
-      return { id: pastWin.id, isNew: false };
-    }
+    const conflict = entryBlockReason(candidate.token.mint);
+    if (conflict) console.log(`[positions] post_swap_gate_conflict ${candidate.token.symbol} (${candidate.token.mint.slice(0, 8)}) — ${conflict.reason} #${conflict.id}; inserting anyway (swap filled)`);
 
     const result = db.prepare(`
       INSERT INTO dry_run_positions (
@@ -214,7 +222,7 @@ export function createLivePosition(candidateId, candidate, decision, swap, reaso
       swap.signature,
       swap.outputAmount || null,
       strat.id,
-      json({ candidate, decision, reason, swap, strategy: strat.id }),
+      json({ candidate, decision, reason, swap, strategy: strat.id, signalPrice, signalMcap, fillPrice, postSwapGateConflict: conflict || null }),
     );
     const positionId = Number(result.lastInsertRowid);
     db.prepare(`
@@ -226,5 +234,28 @@ export function createLivePosition(candidateId, candidate, decision, swap, reaso
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(positionId, tp, sl, trailingEnabled, trailingPercent, now());
     return { id: positionId, isNew: true };
+  })();
+}
+
+// Audit row for a live entry whose swap never filled. Always a fresh closed row; never touches existing rows.
+export function recordFailedEntry(candidateId, candidate, decision, { error, sizeSol, attempts } = {}) {
+  const strat = activeStrategy();
+  const size = sizeSol ?? positionSizeSol(candidate, strat);
+  const t = now();
+  return db.transaction(() => {
+    const result = db.prepare(`
+      INSERT INTO dry_run_positions (
+        candidate_id, mint, symbol, status, opened_at_ms, closed_at_ms, size_sol, tp_percent, sl_percent,
+        trailing_enabled, trailing_percent, trailing_armed, exit_reason, pnl_percent, pnl_sol,
+        llm_decision_id, execution_mode, strategy_id, snapshot_json
+      ) VALUES (?, ?, ?, 'closed', ?, ?, ?, 0, 0, 0, 0, 0, 'FAILED_ENTRY', 0, 0, ?, 'live', ?, ?)
+    `).run(candidateId, candidate.token.mint, candidate.token.symbol, t, t, size, decision?.id || null, strat.id,
+      json({ candidate, decision, reason: 'FAILED_ENTRY', error: error || 'unknown', attempts: attempts ?? null }));
+    const positionId = Number(result.lastInsertRowid);
+    db.prepare(`
+      INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
+      VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, 'FAILED_ENTRY', ?)
+    `).run(positionId, candidate.token.mint, t, null, null, size, null, json({ attempts: attempts ?? null, error: error || 'unknown' }));
+    return { id: positionId };
   })();
 }

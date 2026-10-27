@@ -137,8 +137,8 @@ async function jupiterExecute(order, signedTransaction) {
   return res.data;
 }
 
-export async function executeJupiterSwap({ inputMint, outputMint, amount, guard = null }) {
-  const order = await jupiterOrder({ inputMint, outputMint, amount });
+export async function executeJupiterSwap({ inputMint, outputMint, amount, guard = null, priority = 'entry' }) {
+  const order = await jupiterOrder({ inputMint, outputMint, amount }, priority);
   // Freshness gate hook: dipanggil SEBELUM sign/broadcast. Kalau guard mengembalikan
   // string, swap dibatalkan (tidak ada dana terpakai) dengan kode STALE_SIGNAL_GUARD.
   if (typeof guard === 'function') {

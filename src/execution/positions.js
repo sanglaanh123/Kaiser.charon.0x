@@ -7,10 +7,10 @@ import { firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn, computeAtrP
 import { fetchGmgnTokenInfo } from '../enrichment/gmgn.js';
 import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote, fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { liveWalletPubkey } from '../liveExecutor.js';
-import { fetchChartContextCached } from '../enrichment/market.js';
+import { fetchChartContextCached, fetchTokenMarket } from '../enrichment/market.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
-import { openPositions } from '../db/positions.js';
+import { openPositions, positionValue } from '../db/positions.js';
 import { updateCandidateSnapshot } from '../db/candidates.js';
 import { trending } from '../signals/trending.js';
 import { executeLiveSell } from './router.js';
@@ -130,6 +130,22 @@ export async function refreshCandidateForExecution(row) {
 
 const sellInProgress = new Set();
 
+const PAPER_ROUNDTRIP_FEE_SOL = 30000 / 1e9; // matches paperPnl's 15000 + 15000 lamports
+const bigOf = (v) => /^\d+$/.test(String(v)) ? BigInt(String(v)) : BigInt(Math.floor(Number(v) || 0));
+// Portion of an integer amount (percent may be fractional, 0.01% resolution).
+const portion = (amount, percent) => bigOf(amount) * BigInt(Math.round(Number(percent) * 100)) / 10000n;
+
+// Paper PnL for the remaining tokens plus banked partial proceeds. Plain paperPnl when nothing was banked.
+function paperNet(entryLamports, outLamports, realizedPartialSol) {
+  if (!(Number(realizedPartialSol) > 0)) return paperPnl(entryLamports, outLamports);
+  return positionValue({
+    remainingProceedsSol: Number(outLamports) / 1e9,
+    realizedPartialSol,
+    sizeSol: Number(entryLamports) / 1e9,
+    feesSol: PAPER_ROUNDTRIP_FEE_SOL,
+  });
+}
+
 export async function refreshPosition(position, { autoExit = true, jupiterPnl = null } = {}) {
   // Bug2 fix (2026-06-19): bypass 20s cache for live monitoring — flash crash detection requires fresh data
   // Quote-first: dry and live decisions share the same 10s per-mint executable quote snapshot.
@@ -143,10 +159,14 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     db.prepare('UPDATE dry_run_positions SET pnl_percent=NULL,pnl_sol=NULL WHERE id=? AND status=?').run(position.id, 'open');
     return { ...position, pnl_sol: null, pnl_percent: null, exitReason: null, valuationStatus: 'legacy_unverified' };
   }
-  const asset = await fetchJupiterAsset(position.mint, { useCache: false, ttlMs: 3000 });
+  const exitPriority = isPaper ? 'exit_paper' : 'exit_live';
+  // Jupiter datapi first, GMGN behind it, so a datapi outage doesn't blind the mark fallback.
+  const asset = await fetchTokenMarket(position.mint, { useCache: false, ttlMs: 3000, priority: exitPriority });
   const tokenAmountRaw = isPaper ? paperSnapshot.tokenAmountRaw : position.token_amount_raw || position.token_amount_est;
+  const realizedPartial = Number(position.realized_partial_sol || 0);
+  const strat = strategyById(position.strategy_id);
   const sellQuote = useQuote && tokenAmountRaw
-    ? await fetchJupiterExecutionQuote({ inputMint: position.mint, outputMint: 'So11111111111111111111111111111111111111112', amount: tokenAmountRaw })
+    ? await fetchJupiterExecutionQuote({ inputMint: position.mint, outputMint: 'So11111111111111111111111111111111111111112', amount: tokenAmountRaw }, { priority: exitPriority })
     : null;
   const sellRequest = { inputMint: position.mint, outputMint: 'So11111111111111111111111111111111111111112', amount: tokenAmountRaw };
   const quoteValid = Boolean(sellQuote) && validQuote(sellQuote, sellRequest);
@@ -178,13 +198,16 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   const markPnlPercent = pnlPercent;
   let pnlSol = Number(position.size_sol) * pnlPercent / 100;
   if (quoteProceedsSol != null && Number(position.size_sol) > 0) {
-    pnlSol = quoteProceedsSol - Number(position.size_sol);
-    pnlPercent = pnlSol / Number(position.size_sol) * 100;
+    ({ pnlSol, pnlPercent } = positionValue({ remainingProceedsSol: quoteProceedsSol, realizedPartialSol: realizedPartial, sizeSol: position.size_sol }));
+  } else if (position.partial_tp_done && Number(position.size_sol) > 0) {
+    // Mark fallback after a partial: value the remaining fraction at the mark, add banked proceeds.
+    const remainingFraction = 1 - Number(strat?.partial_tp_sell_percent || 0) / 100;
+    ({ pnlSol, pnlPercent } = positionValue({ remainingProceedsSol: Number(position.size_sol) * remainingFraction * (1 + markPnlPercent / 100), realizedPartialSol: realizedPartial, sizeSol: position.size_sol }));
   }
 
   if (isPaper) {
     if (quoteValid) {
-      const net = paperPnl(paperSnapshot.entryLamports, sellQuote.outAmount);
+      const net = paperNet(paperSnapshot.entryLamports, sellQuote.outAmount, realizedPartial);
       pnlSol = net.pnlSol; pnlPercent = net.pnlPercent;
     }
     // Use SOL quote returns for triggers and trailing, never the inferred USD supply.
@@ -193,7 +216,7 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   }
 
   // Dynamic ATR-based stop loss: fetch chart context and compute ATR% to widen/narrow the static sl_percent.
-  const stratForSl = strategyById(position.strategy_id);
+  const stratForSl = strat;
   const useDynamicSl = (stratForSl?.use_dynamic_sl ?? numSetting('use_dynamic_sl', 1)) ? true : false;
   let effectiveSlPercent = Number(position.sl_percent);
   let atrPercent = null;
@@ -243,7 +266,6 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   let closed = false;
 
   // Max hold time check — tiered by entry mcap
-  const strat = strategyById(position.strategy_id);
   const entryMcap = Number(position.entry_mcap) || 0;
   const isMicrocap = entryMcap > 0 && entryMcap < 15000;
   const isHighcap = entryMcap >= 60000;
@@ -271,33 +293,61 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
     }
   }
 
-  // Partial TP check
-  if (!exitReason && strat?.partial_tp && !position.partial_tp_done && pnlPercent >= strat.partial_tp_at_percent) {
-    db.prepare('UPDATE dry_run_positions SET partial_tp_done = 1 WHERE id = ?').run(position.id);
-    console.log(`[position] ${position.id} partial TP at ${pnlPercent.toFixed(1)}% (${strat.partial_tp_sell_percent}% sell)`);
-    if (position.execution_mode === 'live' && position.token_amount_raw) {
-      try {
-        const sellAmount = Math.floor(Number(position.token_amount_raw) * (strat.partial_tp_sell_percent / 100));
-        if (sellAmount > 0) {
-          const sell = await executeLiveSell({ ...position, token_amount_raw: String(sellAmount) }, 'PARTIAL_TP');
-          const remaining = Number(position.token_amount_raw) - sellAmount;
-          db.prepare('UPDATE dry_run_positions SET token_amount_raw = ? WHERE id = ?').run(String(remaining), position.id);
+  // Partial TP: sell a slice, bank the proceeds, and skip every other exit check this tick.
+  let partialDone = false;
+  if (!exitReason && autoExit && strat?.partial_tp && !position.partial_tp_done && pnlPercent >= strat.partial_tp_at_percent) {
+    const sellPct = Number(strat.partial_tp_sell_percent);
+    try {
+      if (!(sellPct > 0 && sellPct < 100)) throw new Error(`invalid partial_tp_sell_percent ${strat.partial_tp_sell_percent}`);
+      if (!isPaper) {
+        if (sellInProgress.has(position.id)) return { ...position, exitReason: null };
+        const sellAmount = portion(tokenAmountRaw, sellPct);
+        if (sellAmount > 0n) {
+          sellInProgress.add(position.id);
+          let sell;
+          try { sell = await executeLiveSell({ ...position, token_amount_raw: String(sellAmount) }, 'PARTIAL_TP'); }
+          finally { sellInProgress.delete(position.id); }
+          const soldRaw = bigOf(sell.inputAmount ?? sellAmount);
+          const remaining = bigOf(tokenAmountRaw) - soldRaw;
+          const gotSol = Number(sell.outputAmount || 0) / 1e9;
+          db.prepare('UPDATE dry_run_positions SET token_amount_raw = ?, partial_tp_done = 1, realized_partial_sol = COALESCE(realized_partial_sol, 0) + ? WHERE id = ?')
+            .run(String(remaining), gotSol, position.id);
           db.prepare(`
             INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
             VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, 'PARTIAL_TP', ?)
-          `).run(position.id, position.mint, now(), price, mcap,
-            position.size_sol * (strat.partial_tp_sell_percent / 100), sellAmount,
-            json({ pnlPercent, sell, partialSellPercent: strat.partial_tp_sell_percent, remaining }));
-          console.log(`[position] ${position.id} partial TP sold ${sellAmount} tokens, ${remaining} remaining`);
+          `).run(position.id, position.mint, now(), price, mcap, position.size_sol * sellPct / 100, Number(soldRaw),
+            json({ pnlPercent, sell, partialSellPercent: sellPct, remaining: String(remaining), receivedSol: gotSol }));
+          console.log(`[position] ${position.id} partial TP at ${pnlPercent.toFixed(1)}%: sold ${soldRaw} tokens for ${gotSol} SOL, ${remaining} remaining`);
+          partialDone = true;
         }
-      } catch (err) {
-        console.log(`[position] ${position.id} partial sell failed: ${err.message}`);
+      } else if (quoteValid) {
+        const soldRaw = portion(tokenAmountRaw, sellPct);
+        const gotLamports = portion(sellQuote.outAmount, sellPct);
+        if (soldRaw > 0n && gotLamports > 0n) {
+          const remaining = bigOf(tokenAmountRaw) - soldRaw;
+          const gotSol = Number(gotLamports) / 1e9;
+          const snap = { ...paperSnapshot, tokenAmountRaw: String(remaining) };
+          db.transaction(() => {
+            db.prepare('UPDATE dry_run_positions SET partial_tp_done = 1, realized_partial_sol = COALESCE(realized_partial_sol, 0) + ?, snapshot_json = ? WHERE id = ? AND status = ?')
+              .run(gotSol, json(snap), position.id, 'open');
+            db.prepare(`
+              INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
+              VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, 'PARTIAL_TP', ?)
+            `).run(position.id, position.mint, now(), price, mcap, position.size_sol * sellPct / 100, Number(soldRaw),
+              json({ pnlPercent, partialSellPercent: sellPct, remaining: String(remaining), proceedsLamports: String(gotLamports), exitQuote: sellQuote }));
+          })();
+          paperAudit(position.mint, 'partial_tp_filled', { positionId: position.id, soldRaw: String(soldRaw), proceedsLamports: String(gotLamports), remaining: String(remaining) });
+          console.log(`[position] ${position.id} paper partial TP at ${pnlPercent.toFixed(1)}%: ${gotSol} SOL banked, ${remaining} tokens remaining`);
+          partialDone = true;
+        }
       }
+    } catch (err) {
+      console.log(`[position] ${position.id} partial sell failed: ${err.message}`);
     }
   }
 
   // Standard exit checks: trailing/floor exits take priority for armed winners
-  if (!exitReason) {
+  if (!exitReason && !partialDone) {
     if (trailingHit) exitReason = 'TRAILING_TP';
     else if (slHit) exitReason = 'SL';
     else if (tpHit && !position.trailing_enabled) exitReason = 'TP';
@@ -335,9 +385,9 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
         Number(sell.order?.signatureFeeLamports || 0) +
         Number(sell.order?.prioritizationFeeLamports || 0)
       ) / 1_000_000_000;
-      finalPnlSol = receivedSol - Number(position.size_sol) - executionFeesSol;
-      finalPnlPercent = (receivedSol / Number(position.size_sol) - 1) * 100;
-      finalPnlPercent = finalPnlSol / Number(position.size_sol) * 100;
+      ({ pnlSol: finalPnlSol, pnlPercent: finalPnlPercent } = positionValue({
+        remainingProceedsSol: receivedSol, realizedPartialSol: realizedPartial, sizeSol: position.size_sol, feesSol: executionFeesSol,
+      }));
     }
     db.prepare(`
       UPDATE dry_run_positions
@@ -353,17 +403,17 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
   } else if (exitReason && autoExit) {
     let execution = null;
     if (quoteValid) {
-      try { execution = await delayedQuote(sellRequest, fetchJupiterExecutionQuote, { reference: sellQuote }); }
+      try { execution = await delayedQuote(sellRequest, (r) => fetchJupiterExecutionQuote(r, { priority: exitPriority }), { reference: sellQuote }); }
       catch (error) { paperAudit(position.mint, 'exit_rejected', { positionId: position.id, reason: error.message, trigger: exitReason }); }
     }
     // A stop that cannot find a quote must still close: mark-fill it and keep the
     // evidence labelled, otherwise the loss runs unmonitored until quotes return.
-    const net = execution ? paperPnl(paperSnapshot.entryLamports, execution.fill.outAmount) : null;
+    const net = execution ? paperNet(paperSnapshot.entryLamports, execution.fill.outAmount, realizedPartial) : null;
     const dryPnlPercent = net ? net.pnlPercent : pnlPercent, dryPnlSol = net ? net.pnlSol : pnlSol;
     const dryExitMcap = net ? Number(position.entry_mcap) * (1 + dryPnlPercent / 100) : mcap;
-    const dryExitPrice = net ? Number(position.entry_price) * Number(execution.fill.outAmount) / Number(paperSnapshot.entryLamports) : price;
+    const dryExitPrice = net && !position.partial_tp_done ? Number(position.entry_price) * Number(execution.fill.outAmount) / Number(paperSnapshot.entryLamports) : price;
     const evidence = net
-      ? { paperVersion: PAPER_VERSION, pnlPercent: dryPnlPercent, pnlSol: dryPnlSol, ...net, entryLamports: paperSnapshot.entryLamports, proceedsLamports: execution.fill.outAmount, assumedNetworkFeeLamports: '5000', assumedPriorityFeeLamports: '10000', referenceQuote: execution.reference, exitQuote: execution.fill }
+      ? { paperVersion: PAPER_VERSION, pnlPercent: dryPnlPercent, pnlSol: dryPnlSol, ...net, entryLamports: paperSnapshot.entryLamports, proceedsLamports: execution.fill.outAmount, realizedPartialSol: realizedPartial, assumedNetworkFeeLamports: '5000', assumedPriorityFeeLamports: '10000', referenceQuote: execution.reference, exitQuote: execution.fill }
       : { paperVersion: `${PAPER_VERSION}+mark-fallback`, pnlPercent: dryPnlPercent, pnlSol: dryPnlSol, exitMarkPrice: price, exitMarkMcap: mcap, reason: 'quote_unavailable' };
     const closedNow = db.transaction(() => {
       const changed = db.prepare(`UPDATE dry_run_positions SET status='closed',closed_at_ms=?,exit_price=?,exit_mcap=?,exit_reason=?,pnl_percent=?,pnl_sol=? WHERE id=? AND status='open'`).run(now(), dryExitPrice, dryExitMcap, exitReason, dryPnlPercent, dryPnlSol, position.id).changes;

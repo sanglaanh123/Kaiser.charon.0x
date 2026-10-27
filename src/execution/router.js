@@ -5,7 +5,7 @@ import { WSOL_MINT, LIVE_MIN_SOL_RESERVE_LAMPORTS, ENTRY_FRESHNESS_GATE_PCT, ENT
 import { escapeHtml, fmtSol } from '../format.js';
 import { executeJupiterSwap, liveWalletBalanceLamports, fetchLiveTokenBalance, closeEmptyTokenAccounts } from '../liveExecutor.js';
 import { activeStrategy } from '../db/settings.js';
-import { createLivePosition, canOpenMorePositions, openPositionCount } from '../db/positions.js';
+import { createLivePosition, recordFailedEntry, entryBlockReason, positionSizeSol, canOpenMorePositions, openPositionCount } from '../db/positions.js';
 import { intentById } from '../db/intents.js';
 import { logDecisionEvent } from '../db/decisions.js';
 import { refreshCandidateForExecution } from './positions.js';
@@ -16,6 +16,18 @@ import { updateCandidateStatus } from '../db/candidates.js';
 import { createTradeIntent } from '../db/intents.js';
 
 const ENTRY_MAX_ATTEMPTS = 3;
+
+// Test seam for the chain-facing calls.
+const deps = { executeJupiterSwap, fetchLiveTokenBalance };
+export function _setLiveDeps(next = {}) { Object.assign(deps, { executeJupiterSwap, fetchLiveTokenBalance }, next); }
+
+// Serialises gate -> swap -> insert so two buys on one mint can't both pass the gate.
+let entryChain = Promise.resolve();
+function withEntryLock(fn) {
+  const run = entryChain.then(fn, fn);
+  entryChain = run.catch(() => {});
+  return run;
+}
 
 // Freshness gate: bandingkan harga sinyal (candidate.metrics.priceUsd) dengan harga fill dari
 // quote Jupiter (order.inUsdValue / (order.outAmount / 10^decimals)). Kalau drift > ENTRY_FRESHNESS_GATE_PCT%
@@ -47,26 +59,28 @@ function entryFreshnessGuard(candidate) {
   };
 }
 
-export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
-  const strat = activeStrategy();
-  const amountLamports = Math.floor((strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1)) * 1_000_000_000);
+export function executeLiveBuy(...args) {
+  return withEntryLock(() => executeLiveBuyLocked(...args));
+}
+
+async function executeLiveBuyLocked(selectedRow, decision, batchId, rows = [], triggerCandidateId = null) {
+  const sizeSol = positionSizeSol(selectedRow.candidate);
+  const amountLamports = Math.floor(sizeSol * 1_000_000_000);
   const balance = await liveWalletBalanceLamports();
   if (balance < amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) {
     throw new Error(`Insufficient SOL balance. Need ${fmtSol((amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) / 1_000_000_000)} SOL including reserve.`);
   }
   const candidate = selectedRow.candidate;
 
-  // C2 FIX: Dedup BEFORE swap — prevent double-spend if same mint already has open position
-  const existingOpen = db.prepare(
-    'SELECT id FROM dry_run_positions WHERE mint = ? AND status = ? LIMIT 1'
-  ).get(candidate.token.mint, 'open');
-  if (existingOpen) {
-    const err = new Error(`Duplicate entry blocked: ${candidate.token.symbol || candidate.token.mint.slice(0, 8)} already has open position #${existingOpen.id}`);
+  // Shared gate BEFORE any swap: open position, closed <24h, or recent win.
+  const gate = entryBlockReason(candidate.token.mint);
+  if (gate) {
+    const err = new Error(`Entry blocked (${gate.reason}): ${candidate.token.symbol || candidate.token.mint.slice(0, 8)} position #${gate.id}`);
     console.log(`[executeLiveBuy] ${err.message}`);
     logDecisionEvent({
       batchId, triggerCandidateId, selectedRow, rows, decision,
-      mode: 'live', action: 'live_entry_blocked_duplicate',
-      guardrails: { existingPositionId: existingOpen.id },
+      mode: 'live', action: 'live_entry_blocked_gate',
+      guardrails: { gate },
       execution: { error: err.message },
     });
     throw err;
@@ -77,14 +91,14 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   let staleSignal = null;
   for (let attempt = 1; attempt <= ENTRY_MAX_ATTEMPTS; attempt++) {
     try {
-      swap = await executeJupiterSwap({
+      swap = await deps.executeJupiterSwap({
         inputMint: WSOL_MINT,
         outputMint: candidate.token.mint,
         amount: amountLamports,
         guard: entryFreshnessGuard(candidate),
       });
       if (!swap.outputAmount) {
-        swap.outputAmount = await fetchLiveTokenBalance(candidate.token.mint) || swap.outputAmount;
+        swap.outputAmount = await deps.fetchLiveTokenBalance(candidate.token.mint) || swap.outputAmount;
       }
       lastError = null;
       break;
@@ -128,18 +142,7 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   }
   if (!swap) {
     // Record the failed attempt as a closed position so the failure is auditable.
-    const failedSwap = { signature: null, outputAmount: null, error: lastError?.message || 'unknown' };
-    const { id: positionId } = createLivePosition(selectedRow.id, candidate, decision, failedSwap, 'FAILED_ENTRY');
-    db.prepare(`
-      UPDATE dry_run_positions
-      SET status = 'closed', closed_at_ms = ?, exit_reason = 'FAILED_ENTRY', pnl_percent = 0, pnl_sol = 0
-      WHERE id = ?
-    `).run(now(), positionId);
-    db.prepare(`
-      INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
-      VALUES (?, ?, 'buy', ?, ?, ?, ?, ?, 'FAILED_ENTRY', ?)
-    `).run(positionId, candidate.token.mint, now(), null, null, numSetting('dry_run_buy_sol', 0.1), null,
-      json({ attempts: ENTRY_MAX_ATTEMPTS, error: lastError?.message || 'unknown' }));
+    const { id: positionId } = recordFailedEntry(selectedRow.id, candidate, decision, { error: lastError?.message || 'unknown', sizeSol, attempts: ENTRY_MAX_ATTEMPTS });
     logDecisionEvent({
       batchId,
       triggerCandidateId,
@@ -162,7 +165,7 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
     ].join('\n'));
     throw lastError || new Error('Live buy failed without exception');
   }
-  const { id: positionId, isNew } = createLivePosition(selectedRow.id, candidate, decision, swap, `live_batch_${batchId}`);
+  const { id: positionId, isNew } = await createLivePosition(selectedRow.id, candidate, decision, swap, `live_batch_${batchId}`);
   logDecisionEvent({
     batchId,
     triggerCandidateId,
@@ -177,13 +180,25 @@ export async function executeLiveBuy(selectedRow, decision, batchId, rows = [], 
   if (isNew) await sendPositionOpen(positionId);
 }
 
+const toBig = (v) => /^\d+$/.test(String(v)) ? BigInt(String(v)) : BigInt(Math.floor(Number(v) || 0));
+
 export async function executeLiveSell(position, reason) {
-  const amount = position.token_amount_raw || position.token_amount_est;
+  let amount = position.token_amount_raw || position.token_amount_est;
   if (!amount || Number(amount) <= 0) throw new Error('Live position has no token amount to sell.');
-  const sell = await executeJupiterSwap({
+  // Never sell more than the wallet holds (partial sells / external transfers leave the DB amount stale).
+  const balance = await deps.fetchLiveTokenBalance(position.mint);
+  if (balance != null) {
+    const held = toBig(balance);
+    if (held <= 0n) throw new Error(`Live wallet holds 0 of ${position.mint.slice(0, 8)}...; nothing to sell.`);
+    const want = toBig(amount);
+    if (held < want) console.log(`[live] sell clamp ${position.mint.slice(0, 8)}... ${want} -> ${held} (wallet balance)`);
+    amount = String(held < want ? held : want);
+  }
+  const sell = await deps.executeJupiterSwap({
     inputMint: position.mint,
     outputMint: WSOL_MINT,
     amount,
+    priority: 'exit_live',
   });
   try {
     sell.closeAccountSignature = await closeEmptyTokenAccounts(position.mint);
@@ -194,7 +209,11 @@ export async function executeLiveSell(position, reason) {
   return sell;
 }
 
-export async function executeConfirmedIntent(chatId, intentId) {
+export function executeConfirmedIntent(chatId, intentId) {
+  return withEntryLock(() => executeConfirmedIntentLocked(chatId, intentId));
+}
+
+async function executeConfirmedIntentLocked(chatId, intentId) {
   const intent = intentById(intentId);
   if (!intent || intent.status !== 'pending_confirmation') return bot.sendMessage(chatId, 'Pending intent not found.');
   if (!canOpenMorePositions()) {
@@ -216,22 +235,31 @@ export async function executeConfirmedIntent(chatId, intentId) {
         `Failures: ${escapeHtml((freshRow.candidate.filters?.failures || []).join('; ') || 'fresh execution guard failed')}`,
       ].join('\n'), { parse_mode: 'HTML', disable_web_page_preview: true });
     }
-    const strat = activeStrategy();
-    const amountLamports = Math.floor((strat.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1)) * 1_000_000_000);
+    const gate = entryBlockReason(freshRow.candidate.token.mint);
+    if (gate) {
+      db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_entry_gate', now(), intentId);
+      logDecisionEvent({
+        batchId: null, triggerCandidateId: intent.candidate_id, selectedRow: freshRow, rows: [], decision,
+        mode: 'live', action: 'live_entry_blocked_gate', guardrails: { gate, intentId },
+        execution: { error: `entry blocked (${gate.reason})` },
+      });
+      return bot.sendMessage(chatId, `Entry blocked (${gate.reason}) by position #${gate.id}.`);
+    }
+    const amountLamports = Math.floor(positionSizeSol(freshRow.candidate) * 1_000_000_000);
     const balance = await liveWalletBalanceLamports();
     if (balance < amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) {
       db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('rejected_insufficient_balance', now(), intentId);
       return bot.sendMessage(chatId, `Insufficient SOL balance. Need ${fmtSol((amountLamports + LIVE_MIN_SOL_RESERVE_LAMPORTS) / 1_000_000_000)} SOL.`, { parse_mode: 'HTML' });
     }
-    const swap = await executeJupiterSwap({
+    const swap = await deps.executeJupiterSwap({
       inputMint: WSOL_MINT,
       outputMint: freshRow.candidate.token.mint,
       amount: amountLamports,
     });
     if (!swap.outputAmount) {
-      swap.outputAmount = await fetchLiveTokenBalance(freshRow.candidate.token.mint) || swap.outputAmount;
+      swap.outputAmount = await deps.fetchLiveTokenBalance(freshRow.candidate.token.mint) || swap.outputAmount;
     }
-    const { id: positionId, isNew } = createLivePosition(intent.candidate_id, freshRow.candidate, decision, swap, `confirmed_intent_${intentId}`);
+    const { id: positionId, isNew } = await createLivePosition(intent.candidate_id, freshRow.candidate, decision, swap, `confirmed_intent_${intentId}`);
     db.prepare('UPDATE trade_intents SET status = ?, updated_at_ms = ? WHERE id = ?').run('executed_live', now(), intentId);
     logDecisionEvent({
       batchId: null,
