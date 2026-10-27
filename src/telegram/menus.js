@@ -4,7 +4,7 @@ import { openPositionCount, tradingMode, allPositions } from '../db/positions.js
 import { savedWallets } from '../enrichment/wallets.js';
 import { gmgnStatusText } from '../enrichment/gmgn.js';
 import { formatPosition } from './format.js';
-import { ENABLE_LLM, LLM_API_KEY } from '../config.js';
+import { ENABLE_JEV, TYPESAFE_API_KEY } from '../config.js';
 
 export function menuKeyboard() {
   return {
@@ -81,7 +81,7 @@ export const strategyNumericLabels = {
   trending_min_swaps: 'minimum trending swaps',
   trending_max_rug_ratio: 'maximum trending rug ratio (0.3 = 30%)',
   trending_max_bundler_rate: 'maximum trending bundler rate (0.5 = 50%)',
-  llm_min_confidence: 'LLM minimum confidence percent',
+  llm_min_confidence: 'Jev minimum confidence percent (P(BUY)x100)',
   position_size_sol: 'position size SOL',
   max_open_positions: 'maximum open positions',
   tp_percent: 'take profit percent',
@@ -120,7 +120,7 @@ export function agentText() {
     `Strategy: <b>${escapeHtml(strat.name)}</b>`,
     `Agent: <b>${boolSetting('agent_enabled', true) ? 'on' : 'off'}</b>`,
     `Mode: <b>${escapeHtml(tradingMode())}</b>`,
-    `LLM: <b>${strat.use_llm && ENABLE_LLM && LLM_API_KEY ? 'configured' : 'disabled'}</b>`,
+    `Jev: <b>${strat.use_llm && ENABLE_JEV && TYPESAFE_API_KEY ? 'configured' : 'disabled'}</b>`,
     `Confidence: ${fmtPct(strat.llm_min_confidence || numSetting('llm_min_confidence'))}`,
     `Open positions: ${openPositionCount()}/${strat.max_open_positions || 'unlimited'}`,
     `Batch candidates: ${numSetting('llm_candidate_pick_count', 10)}`,
@@ -209,7 +209,7 @@ export function strategyMenuText() {
     strat.max_ath_distance_pct < 0 ? `Max ATH distance: ${strat.max_ath_distance_pct}%` : null,
     strat.partial_tp ? `Partial TP: ${strat.partial_tp_sell_percent}% at ${fmtPct(strat.partial_tp_at_percent)}` : null,
     strat.max_hold_ms > 0 ? `Max hold: ${Math.round(strat.max_hold_ms / 60000)}m` : null,
-    strat.use_llm ? `LLM: yes (min ${strat.llm_min_confidence}%)` : 'LLM: no (rule-based)',
+    strat.use_llm ? `Jev: yes (min ${strat.llm_min_confidence}%)` : 'Jev: no (rule-based)',
     '',
     ...all.map(s => `${s.enabled ? '▶' : '○'} ${s.name}`),
   ].filter(Boolean).join('\n');
@@ -241,7 +241,7 @@ export function strategyKeyboard() {
     ],
     [
       { text: `Fee Req ${strat.require_fee_claim ? 'on' : 'off'}`, callback_data: 'stratcfg:require_fee_claim' },
-      { text: `LLM ${strat.use_llm ? 'on' : 'off'}`, callback_data: 'stratcfg:use_llm' },
+      { text: `Jev ${strat.use_llm ? 'on' : 'off'}`, callback_data: 'stratcfg:use_llm' },
     ],
     [
       { text: `Min Holders ${strat.min_holders}`, callback_data: 'stratinput:min_holders' },
@@ -312,7 +312,7 @@ export function candidateButtons(candidateId, decision = null) {
     return {
       reply_markup: {
         inline_keyboard: [
-          [{ text: 'LLM BUY selected', callback_data: 'noop' }],
+          [{ text: 'Jev BUY selected', callback_data: 'noop' }],
           [
             { text: 'View Candidate', callback_data: `cand:${candidateId}` },
             { text: 'Positions', callback_data: 'menu:positions' },

@@ -8,7 +8,7 @@ import { storeDecision, storeBatchDecision, logDecisionEvent, checkDecisionCache
 import { buildCandidate, filterCandidate, signalLabel, signalMarketSnapshot } from './candidateBuilder.js';
 import { preScoreCandidate } from './preScorer.js';
 import { momentumFilter } from './momentumFilter.js';
-import { decideCandidateBatch } from './llm.js';
+import { decideCandidateBatch } from './jev.js';
 import { activeStrategy } from '../db/settings.js';
 import { createDryRunPosition, createLivePosition, canOpenMorePositions, openPositionCount, tradingMode } from '../db/positions.js';
 import { sendBatchReveal, sendTelegram, sendPositionOpen, sendTradeIntent } from '../telegram/send.js';
@@ -179,6 +179,9 @@ export async function processCandidateFromSignals(signals) {
     return;
   }
   candidate.filters.momentumScore = momentumResult.score;
+  // Batch rows are read back from the DB, so persist the scores Jev's state uses.
+  candidate.preScore = { score: preScore.score, threshold: preScore.threshold };
+  updateCandidateSnapshot(candidateId, candidate);
 
   let rows, batchDecision, batchId;
 

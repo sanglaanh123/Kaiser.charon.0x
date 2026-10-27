@@ -232,6 +232,7 @@ export function initDb() {
     llm_candidate_pick_count: process.env.LLM_CANDIDATE_PICK_COUNT || '10',
     llm_candidate_max_age_ms: process.env.LLM_CANDIDATE_MAX_AGE_MS || String(10 * 60 * 1000),
     llm_min_confidence: '75',
+    jev_max_rug: '0.35',
     sideways_timeout_minutes: '0',
     max_open_positions: process.env.MAX_OPEN_POSITIONS || '3',
     dry_run_buy_sol: '0.1',
