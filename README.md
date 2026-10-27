@@ -1,93 +1,80 @@
 # Kaiser.Charon
 
-![node](https://img.shields.io/badge/node-%E2%89%A520-339933?style=flat-square&logo=node.js&logoColor=white)
+![node](https://img.shields.io/badge/node-22-339933?style=flat-square&logo=node.js&logoColor=white)
 ![chain](https://img.shields.io/badge/network-solana-9945ff?style=flat-square)
 ![mode](https://img.shields.io/badge/execution-dry__run-c9a227?style=flat-square)
 ![license](https://img.shields.io/badge/license-none%20%C2%B7%20personal%20project-555?style=flat-square)
 
-A Telegram bot that screens Solana pump.fun tokens, filters them through a strategy, asks Jev (TypeSafe System One, a classifier) to score entries, and executes through Jupiter. Three modes: `dry_run` (paper fills into SQLite), `confirm` (Telegram approve/reject), and `live` (real swaps).
+A Telegram bot that screens Solana pump.fun tokens, filters them through a configurable strategy, scores entries with the Jev classifier (TypeSafe System One), and executes through Jupiter. It runs in three modes: `dry_run` (paper trading against a simulated SOL wallet, stored in SQLite), `confirm` (Telegram approve/reject buttons), and `live` (real swaps).
 
-A working fork of [yunus-0x/charon](https://github.com/yunus-0x/charon). All credit for the original idea and codebase goes to him — I kept changing things while running it, and at some point the diff got big enough that it needed its own home.
+> Fork of [kaiserern/Kaiser.charon](https://github.com/kaiserern/Kaiser.charon), itself a fork of [yunus-0x/charon](https://github.com/yunus-0x/charon). Original idea and codebase by yunus-0x; much of the execution-path hardening by kaiserern. Older fix history lives in the upstream repos.
 
-> **Read [Notes](#notes) before trusting any PnL number this thing prints.** Dry-run PnL is only as honest as the quotes feeding it, and for a while mine weren't.
-
-`Quick start` · `Configuration` · `How it runs` · `Fix log` · `Notes` · `Security`
-
-## At a glance
-
-| Topic | Current state |
-|---|---|
-| **Pipeline** | signal → enrich → filter → score → decision → position |
-| **Active route** | `pumpfun_pregrad` only (allowlist, gated before enrichment) |
-| **Exit rules** | SL −20% · arm trailing at +10% · trail 8% · TP +50% · max hold 30m |
-| **Sizing** | 0.1 SOL/trade · 5 concurrent positions · liquidity floor $15k |
-| **Decision** | Jev classifier (verdict / rug / momentum); `llm_min_confidence` = P(BUY)×100, recalibrate in `dry_run` |
-| **Jupiter budget** | free tier: 1 RPS main bucket, priority queue (exits first); `max_open_positions` ≤ 3 fits |
-| **Storage** | SQLite in WAL mode; hot-read strategy params, env only on restart |
-| **Tests** | offline tests (`npm test`), no network or keys needed |
+Jump to: [What this fork changes](#what-this-fork-changes) · [Quick start](#quick-start) · [Configuration](#configuration) · [How it runs](#how-it-runs) · [Telegram commands](#telegram-commands) · [Notes](#notes-and-caveats) · [Security](#security)
 
 ## What this fork changes
 
-- **Fill-to-fill dry run (`quote-paper-2.0`)** — paper entries use an executable Jupiter buy quote and exits an executable sell quote, instead of synthetic mark prices. Recorded PnL includes the simulated fill difference and fees, so it tracks live execution.
-- **Route allowlist** — `allowed_routes` gates every signal source at the pipeline entrance, before any enrichment call. Routes that are not listed cost nothing and never reach a filter.
-- **FLOW filter** — candidates need `s1h_priceChange >= 0` and `net_buyer_ratio_5m >= 0.2`.
-- **PumpPortal WebSocket + pre-grad scanner** — real-time create/migrate events and bonding-curve tokens before graduation, instead of polling alone.
-- **GMGN signed auth** — Ed25519-signed requests for holder counts, fees and socials.
-- **Trailing TP guard** — trailing no longer fires on underwater positions. It used to "lock in profit" at a loss.
-- **Telegram reports + rendered cards**, plus **backtest tooling** so filter changes get measured against local trade history before deployment.
-- **Live execution hardening** — realized PnL tracking, sell guards, Jupiter Ultra routing.
+- **Single Jupiter client.** All Jupiter traffic goes through `jupiterFetch` in `src/enrichment/jupiter.js`. Free-tier limits are modelled directly: a main bucket (1 RPS / 60 RPM) for `/order`, `/quote`, price and token lookups, a separate bucket for `/execute`, and a best-effort bucket for `datapi`. A priority queue serves exits first, then entries, then enrichment. Tunable with `JUP_MAIN_RPS`, `JUP_MAIN_RPM`, `JUP_DATAPI_RPS`; `JUP_FORCE_FALLBACK` forces the GMGN path for debugging. `fetchTokenMarket` falls back to GMGN when Jupiter data is unavailable.
+- **Jev replaces the LLM chain.** Jev returns a verdict (PASS / WATCH / BUY), a rug score and a momentum score. `llm_min_confidence` is now P(BUY) x 100 and must be recalibrated in `dry_run`; `jev_max_rug` caps the rug score for a BUY.
+- **Live money-path fixes.** An entry gate runs before the swap, so a filled swap is never orphaned. `FAILED_ENTRY` rows no longer overwrite history. Partial take-profit banks `realized_partial_sol` and PnL includes it. Live sells are clamped to the wallet balance, the live entry price comes from the actual fill, and an entry lock prevents double entries.
+- **Paper wallet** (new in this fork). `dry_run` tracks a simulated SOL balance derived from positions. It starts at `paper_starting_balance_sol`, keeps the same reserve as live (`LIVE_MIN_SOL_RESERVE`), models a per-leg fee (15,000 lamports) and ATA rent locked until close, and rejects entries with `paper_insufficient_balance` when the available balance is too low. `/paper_reset [sol]` starts a new epoch (refused while paper positions are open); `/status` shows the wallet.
+- **One route gate.** `allowed_routes` is the only route filter. Routes that are not allowed are stored as data-only signal events and never traded. Dead signal sources were removed.
+- **Fee claims.** Fee-claim signals come from the signal server and from an on-chain WebSocket listener (`FEE_CLAIM_WS_ENABLED`; needs `SOLANA_WS_URL` or `HELIUS_API_KEY`).
+- **pump.fun access.** Graduated and pre-graduation scanning use the pump.fun REST API, with an optional local Cloudflare sidecar (`CHARON_CF_FETCH_URL`) for hosts that get blocked.
+- **Observability.** `/status` shows Jupiter budget usage; `/pnl` is computed from the database.
 
 ## Quick start
 
+Requirements: Node.js 22 and a Telegram bot token. `better-sqlite3` and `canvas` are native modules; there is no `better-sqlite3` prebuild for Node 26, so on Windows (or anywhere without build tools) stay on Node 22. On Linux install `build-essential python3 pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev` first.
+
 ```bash
-git clone https://github.com/kaiserern/Kaiser.charon.git
-cd Kaiser.charon
-npm install                 # native build — see Requirements
-cp .env.example .env        # fill in tokens + RPC below
-npm run check               # syntax check before first boot
-npm test                    # offline tests
+git clone https://github.com/sanglaanh123/Kaiser.charon.0x.git
+cd Kaiser.charon.0x
+npm install
+cp .env.example .env     # then edit
+npm test                 # offline tests, no network or keys needed
 npm start
 ```
 
-Minimum `.env` for dry run:
+Minimal `.env` for `dry_run`:
 
 ```bash
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...   # @BotFather
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...   # from @BotFather
 TELEGRAM_CHAT_ID=your_chat_id
 SIGNAL_SERVER_URL=https://api.thecharon.xyz/api
 SIGNAL_SERVER_KEY=your_signal_key
-JUPITER_API_KEY=your_jupiter_key       # required, free tier works
+JUPITER_API_KEY=your_jupiter_key       # required; free tier works
 GMGN_API_KEY=your_gmgn_key             # or GMGN_ENABLED=false
 TYPESAFE_API_KEY=your_typesafe_key     # or ENABLE_JEV=false
 TRADING_MODE=dry_run
 ```
 
-No RPC or wallet is needed for `dry_run`. `HELIUS_API_KEY` / `SOLANA_RPC_URL` and `SOLANA_PRIVATE_KEY` are only required for `confirm` / `live`. Adding `HELIUS_API_KEY` (or `SOLANA_WS_URL`) also turns on the on-chain fee-claim listener. Startup fails with an error naming the missing variable.
+`dry_run` needs no wallet and no RPC. `confirm` and `live` additionally need `SOLANA_PRIVATE_KEY` and an RPC (`HELIUS_API_KEY` or `SOLANA_RPC_URL`). Startup fails with an error naming any missing variable. The SQLite database is created at `DB_PATH` on first run.
 
-The SQLite database is created at `DB_PATH` on first run. Nothing else to provision.
+The signal server key is issued by the upstream maintainers; see [yunus-0x/charon](https://github.com/yunus-0x/charon).
 
 ## Configuration
 
-Two places, deliberately:
+Two places:
 
-1. **`.env`** — API keys, RPC URLs, feature flags, mode. Restart to apply.
-2. **SQLite `settings` / `strategies`** — every strategy parameter. **Hot-read**, tuned live from `/menu` in Telegram without a restart.
+1. **`.env`**: API keys, RPC URLs, feature flags, mode. Restart to apply.
+2. **SQLite `settings` / `strategies`**: strategy parameters, read on use (hot). Edit from `/menu`, `/setfilter` and `/stratset` in Telegram, no restart. Settings are seeded with `INSERT OR IGNORE`, so an existing database keeps its stored values even if the code default changes.
 
-Live values on the running instance:
+Key settings and their code defaults:
 
-| Setting | Value | Why |
+| Setting | Default | Notes |
 |---|---|---|
-| `allowed_routes` | `pumpfun_pregrad` | only route with measured positive expectancy (see Notes) |
-| `min_liquidity_usd` | `15000` | below this the sell quote is the market |
-| `max_open_positions` | `5` | each position costs ~2 quote calls/tick; ≤ 3 is what fits the 1 RPS free Jupiter budget |
-| `trailing_arm_percent` | `10` | arm later, give runners room |
-| `trailing_floor_percent` | `8` | floor after arming |
-| `tp_percent` / `sl_percent` | `50` / `-20` | wider target, tighter stop |
-| `max_hold_ms` | `1800000` | 30 min — pregrad runners die fast |
-| `use_llm` | `false` | rule-based path for the single route; set `true` to route decisions through Jev |
-| `jev_max_rug` | setting | Jev rug-score ceiling for BUY |
+| `allowed_routes` | `single_source,multi_source,fee_graduated,fee_trending,trending,trenches_completed,pumpportal_graduated,dip_sniper,dip_dip_buy,dip_smart_money,dip_degen` | Seeded list; an empty value allows all routes. Review it against your own results. |
+| `max_open_positions` | `3` (`MAX_OPEN_POSITIONS`) | Each open position costs quote calls every tick; 3 or fewer fits the free Jupiter budget. |
+| `min_liquidity_usd` | `6000` | Read at filter time; not seeded in the settings table. |
+| `llm_min_confidence` | `75` | P(BUY) x 100 from Jev. Per-strategy overrides exist (sniper seeds `40`). Recalibrate in `dry_run`. |
+| `jev_max_rug` | `0.35` | Maximum Jev rug score for a BUY. |
+| `paper_starting_balance_sol` | `1` | Paper wallet starting balance (part of the paper-wallet change). |
+| `LIVE_MIN_SOL_RESERVE` (env) | `0.02` | SOL kept back from sizing; the paper wallet uses the same reserve. |
+| `JUP_MAIN_RPS` / `JUP_MAIN_RPM` (env) | `1` / `60` | Free tier. On the Jupiter Developer plan ($25/mo, 10 RPS) set `10` / `600`. |
 
-Optional subsystems are off until their flag is set: `GMGN_ENABLED`, `PUMPPORTAL_ENABLED` (needs `PUMPPORTAL_API_KEY`), `PREGRAD_ENABLED`, `ENABLE_JEV` (needs `TYPESAFE_API_KEY`), `FEE_CLAIM_WS_ENABLED` (needs `SOLANA_WS_URL` or `HELIUS_API_KEY`), `TRENDING_ENABLED=false` (disables GMGN trending **and** trending candidates arriving from the signal server).
+Optional subsystems are controlled by flags: `GMGN_ENABLED`, `PUMPPORTAL_ENABLED` (uses `PUMPPORTAL_API_KEY`), `PREGRAD_ENABLED`, `ENABLE_JEV` (needs `TYPESAFE_API_KEY`), `FEE_CLAIM_WS_ENABLED`, `TRENDING_ENABLED`. See `.env.example` for the full list.
+
+Four built-in strategies are seeded: Sniper (default), Dip Buy, Smart Money and Degen (no Jev). Switch with `/strategy`.
 
 ## How it runs
 
@@ -116,131 +103,63 @@ EXECUTION LOOP (10s)
   monitorPositions() → Jupiter sell quote (fill-to-fill)
   → SL / TP / trailing / max-hold
   → close → SQLite → Telegram card
+  dry_run only: paper wallet (balance from positions, reserve,
+  per-leg fee, ATA rent) gates entries before they open
 ```
 
-Position monitoring is quote-first: exits price on an executable sell quote. If quoting fails, the position is valued at a labelled mark fallback rather than skipped — every exit rule still evaluates. See the fix log for why that distinction matters.
-
-## Fix log
-
-### 2026-10-27 — refactor: one Jupiter client, Jev, live money-path fixes
-
-| Area | Symptom | Fix |
-|---|---|---|
-| Jupiter client | many callers each rate-limited (or not) on their own | single client with `main` / `execute` / `datapi` buckets and a priority queue (exits first); `/status` shows usage and 429 count |
-| Market data | Jupiter-only; a 429 meant no data | `fetchTokenMarket` falls back to GMGN; cheap prefilter before any network call; decisions cached in `decision_cache` |
-| Live entry | a filled swap could be orphaned, `FAILED_ENTRY` rows overwritten | entry gate + entry lock, `recordFailedEntry`, never orphan a filled swap |
-| Partial TP | realized PnL of the partial leg was lost | recorded in `realized_partial_sol` |
-| Signal sources | dead sources still wired | removed; `allowed_routes` is the only route gate; fee-claim WS listener wired (`FEE_CLAIM_WS_ENABLED`); trending polls at >= 60s with GMGN fallback |
-| Decision | LLM provider chain | replaced by Jev; `llm_min_confidence` is now P(BUY)×100 |
-| `/pnl` | built from saved-wallet queries | computed from the DB |
-
-### 2026-10-23 — the bleed was plumbing
-
-17 red days, win rate down to ~36%. The strategy was not unlucky; the execution path was lying to it.
-
-| Area | Symptom | Fix |
-|---|---|---|
-| Jupiter quotes | unauthenticated `lite-api.jup.ag`, ~2,130 HTTP 429/day, quoting dark ~28% of the day | moved to `api.jup.ag` with `x-api-key`; measured 0 × 429 after |
-| Rate limiting | one 429 tripped a **global 30s backoff**, freezing quoting for every token | header-aware governor: reads the 10 req/s bucket from `x-ratelimit-*`, pulls the slot to the reset when ≤1 remains. `backing off (429)` went 2,720 → 0 |
-| Position monitor | missing sell quote hit an early `return`, leaving `pnl_percent` NULL — **SL, trailing and max-hold never evaluated** | fallback mark valuation (`valuationStatus='mark_fallback'`) keeps every rule alive; unquotable exits get closed and labelled |
-| Stop loss | realised average **−27.2%** against a −20% config | after the monitor fix: **−20.6%** |
-| Entry gate | two fresh quotes 2s apart rejected **714 mints/day** (`reference_quote_missing_or_stale`) on un-indexed `*pump` tokens; `pumpportal_graduated` converted 1.5% of candidates | 3 retries, 700ms apart, for fresh graduates only |
-| Misreported reason | `missing_decimals_or_sol_price` — decimals were always present, the SOL/USD fetch was failing | split into two reasons; SOL/USD cached 60s with a 10-minute last-good fallback |
-| Slippage gate | `slippage_exceeds_3_percent` looked like a bug (185 critical alerts/day) | **not a bug.** Replayed 24 rejected mints against Jupiter candles: median **−5.6%** at 3m, **−19.3%** at 5m, **−38.4%** at 10m, only 10% positive at 10m. Gate stays at 3%; the drift is now in the message and the alert downgraded to informational |
-| Signal ingress | `trending_enabled=false` only stopped the internal poller — `single_source` / `graduated_trending` still arrived via the signal server and were traded | enforced at `serverClient` ingress, then superseded by the route allowlist below |
-| Route allowlist | routes decayed into negative expectancy but kept trading | `allowed_routes` gate at the top of `processCandidateFromSignals()`, ahead of enrichment — covers all seven ingress paths in one place |
-| Liquidity floor | `$6,000` hardcoded | reads `min_liquidity_usd` from settings, default unchanged |
-| pump.fun access | `403 Just a moment` from `frontend-api-v3.pump.fun`, permanent | headless-Chromium sidecar on loopback (see below) |
-| GMGN market cap | `price` is an **object**; `Number(info.price)` was NaN for every live mint, so mcap resolved to `0` and the graduation check could never fire | unwrap the nested object, fall back to `migration_market_cap`, regression tests |
-| Bridge | `dry_run_trades(position_id)` had no index → query >60s → unit timed out on every run; plus an internal 8s deadline in `bridge-export.py` | index added (~0.5s), deadline raised to 20s, `CPUQuota` set |
-| Config drift | `max_open_positions` was 3 / 5 / 15 across `.env`, strategy and settings — the bot used 15, multiplying quote pressure | 5 everywhere; `TRENDING_ENABLED` aligned |
-| Disk | `charon.log` unrotated at 351 MB on a 92%-full disk | `/etc/logrotate.d/charon` (daily, 7 rotations, 200 MB cap, `copytruncate`) |
-
-### 2026-10-25 — GMGN queue starvation
-
-The bot went ~38 hours without opening a position while `pumpfun_pregrad` candidates kept arriving. Cause was upstream of the filter: every candidate had `gmgn = null`, so `metrics.liquidityUsd` fell back to Jupiter's DEX liquidity (~$10.7k) instead of GMGN's pool liquidity (~$22.7k) — and the $15k floor rejected 169 of 176 candidates in 24 hours.
-
-| Area | Symptom | Fix |
-|---|---|---|
-| GMGN queue | single serial queue with 2.5s pacing; one overrunning request held the chain forever, so every later caller died at the 15s deadline (`gmgn queue deadline exceeded`) and `fetchGmgnTokenInfo` returned `null` silently | the chain is now bounded by the deadline, not by the work item |
-| Feed hygiene | the pumpportal bonding-curve monitor polled GMGN for up to 50 tracked mints every 25s even though its only route (`pumpportal_graduated`) was allowlisted out — 2 req/s of demand against 0.4 req/s of capacity | token tracking stops when the route is not in `allowed_routes`; the DOWN alert now says "no trading impact" instead of paging "bot blind to new tokens" |
-| Recovery | restarting cleared the wedge and the next pregrad candidate enriched correctly (liq $22,758, filter passed, position opened) | — |
-
-pumpportal.fun itself was serving `502 Bad Gateway` from nginx on `/api/data` (both HTTP and WebSocket upgrade) for the entire window — an upstream outage, not a client fault, and unrelated to the zero-entry problem.
+Exits are quote-first: a position is priced on an executable sell quote. If quoting fails, it is valued at a labelled mark fallback instead of being skipped, so every exit rule still evaluates.
 
 ### Optional: pump.fun Cloudflare sidecar
 
-If your host gets `403` from `frontend-api-v3.pump.fun`, the pregrad scanner and graduation detection cannot reach the REST API directly. They fall back to a local daemon that fetches through headless Chromium.
+If your host gets `403 Just a moment` from `frontend-api-v3.pump.fun`, the pregrad scanner and graduation detection cannot reach the REST API directly. They fall back to a local daemon that fetches through headless Chromium. Retrying harder does not help; this is Cloudflare, not rate limiting.
 
 ```bash
 python3 -m venv /opt/charon-cf/venv
 /opt/charon-cf/venv/bin/pip install playwright==1.63.0
 /opt/charon-cf/venv/bin/playwright install chromium
-# run /opt/charon-cf/fetchd.py under systemd, loopback only
+# run your fetch daemon (e.g. /opt/charon-cf/fetchd.py) under systemd, loopback only
 ```
 
-It binds `127.0.0.1:8799`, serves `GET /fetch?url=<target>` with a host allowlist, and holds no credentials or wallet keys. Override with `CHARON_CF_FETCH_URL`. Without it the bot still runs — those two routes just stay dark.
+The daemon script itself is not shipped in this repo; the bot side is `src/enrichment/cfFetch.js`, which only expects `GET {CHARON_CF_FETCH_URL}/fetch?url=<target>` to answer `{ "body": <target JSON> }` (400 = target rejected, 502 = challenge not cleared).
 
-## Requirements
+It binds `127.0.0.1:8799`, serves `GET /fetch?url=<target>` with a host allowlist, and holds no credentials or wallet keys. Override with `CHARON_CF_FETCH_URL`. Without it, the two routes that need pump.fun REST stay dark; everything else runs.
 
-- **Node.js 20+** (tested on 22)
-- Native build tools: `build-essential python3 pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev`
-- A **Telegram bot token** and chat ID
-- A **signal server key** — see the [original repo](https://github.com/yunus-0x/charon) for access
-- A **Jupiter API key** (free tier works), a **GMGN API key**, and a **TypeSafe API key** for Jev
-- For `confirm` / `live` only: a **Solana wallet private key** (dedicated trading wallet) and an RPC (**Helius** key or `SOLANA_RPC_URL`)
-- Optional: `SOLANA_WS_URL` / Helius key for the on-chain fee-claim listener
-- Jupiter free tier is 1 RPS, which fits `max_open_positions` ≤ 3. On Jupiter Developer ($25/mo, 10 RPS) set `JUP_MAIN_RPS=10` and `JUP_MAIN_RPM=600`.
+## Telegram commands
 
-## Operations
+Registered with Telegram (`setMyCommands`):
 
-```bash
-systemctl status charon
-tail -f charon.log | grep -E "429|quote|exit|\[candidate\]"
-
-# exit-reason breakdown — read this before the total
-sqlite3 charon.sqlite "SELECT exit_reason, COUNT(*), ROUND(AVG(pnl_percent),2)
-  FROM dry_run_positions GROUP BY 1;"
-```
-
-Start with `TRADING_MODE=dry_run`, watch it for a week. Dry run uses executable quotes on both sides now, but it is still an estimate: API failures trigger fallbacks, and live swaps add wallet state, priority fees, confirmation latency and worse slippage than the quote you saw.
-
-## Troubleshooting
-
-| Symptom | Check |
+| Command | Purpose |
 |---|---|
-| Jupiter 429s / stale quotes | `/status` shows main req/60s, 429 count, datapi backoff and queue depth. Lower `max_open_positions`, or on a paid plan raise `JUP_MAIN_RPS` / `JUP_MAIN_RPM` |
-| Jev never called | `ENABLE_JEV` not `false`? `TYPESAFE_API_KEY` set? `use_llm` on for the strategy? |
-| Fee-claim WS off (`[fee] WS listener off`) | set `SOLANA_WS_URL` or `HELIUS_API_KEY` (and not `FEE_CLAIM_WS_ENABLED=false`) |
-| Startup error `X is required` | the message names the missing variable; RPC and wallet are only needed for `confirm` / `live` |
-| pump.fun `403 Just a moment` | run the CF sidecar (see above) |
+| `/menu` | Main menu: strategies, settings, positions |
+| `/strategy` | Show or switch strategy |
+| `/stratset <id> <key> <value>` | Set a strategy config value |
+| `/positions` | List positions |
+| `/candidate <mint>` | Show a candidate by mint |
+| `/filters` | Show current filters |
+| `/setfilter` | Set a filter value |
+| `/status` | Bot mode, Jupiter rate-limit usage, paper wallet |
+| `/pnl` | Realised PnL from the database (live vs paper) |
+| `/paper_reset [sol]` | Start a new paper wallet epoch, optionally with a new starting balance (refused while paper positions are open) |
+| `/learn` | Run the manual learning report |
+| `/lessons` | Show active screening lessons |
+| `/walletadd`, `/walletremove`, `/wallets` | Manage saved wallets for exposure/PnL |
 
-## Notes
+Handled but not listed in the Telegram command menu: `/report` (daily report).
 
-Operational notes I wish someone had written down for me. Read them before drawing conclusions from the numbers.
+## Notes and caveats
 
-- **The old +40 SOL "profit" was an artifact.** Before `quote-paper-2.0` (2026-10-06) dry-run PnL came from indexer **mark** prices, not prices you could fill at. It looked great and meant nothing. Records before that date are not comparable to records after it — the pricing model changed, not the market.
-- **Fill-to-fill PnL is the only number worth arguing about.** Even it is optimistic against live: real swaps add priority fees, wallet state, confirmation latency, and worse slippage than the quote you saw.
-- **Stop loss is a target, not a guarantee.** The bot exits *at* the quote it receives. On thin books the realised number lands a couple of points worse than `sl_percent`. Seeing −27% on a −20% stop is a plumbing problem (no quote at evaluation time), not a rounding error.
-- **A strategy can be profitable and still be a loser.** Win rate × average win has to beat (1 − win rate) × average loss. At −20% stops and +25% targets you need >45% win rate just to break even. Check the exit-reason breakdown, not the total.
-- **Route composition beats parameter tuning.** Replaying all 1,580 era-2 entries through Jupiter 1m candles under the current exit config (2% round-trip cost): `single_source` −3.3%, `graduated_trending` −6.2%, `trenches_completed` −0.7%, `pumpportal_graduated` +1.0% (n=22), `pumpfun_pregrad` **+0.2%** — the only route with a large enough sample to be non-negative, and only barely. Those are replay numbers, not live PnL, and they are optimistic: entries whose candles could not be aligned to the real entry price (dead markets, mostly heavy losers) are excluded. Treat +0.2% as a ceiling. No exit configuration rescues a route with negative expectancy — that is why the allowlist exists, and why this is an experiment rather than a proven edge.
-- **1,580 entries is not 1,580 opportunities.** Replaying the same trades showed a median peak of **+18% at 10 minutes** and **+26% at 30**, but the deployed exits captured far less — the path was there, the exit plumbing was not. That is a fill-and-monitor problem first, a signal problem second.
-- **Concentration has a cost.** `pumpfun_pregrad` only accepts tokens at 90–100% of the bonding curve with a real SOL reserve in a narrow band, so expect **a few trades a day with 30–60 minute gaps**, not a steady stream. Low trade count is the route working as designed, not the bot idling.
-- **Signal sources are not free.** Each route has its own fee, liquidity and latency profile, and a route that worked for months can decay.
-- **Disk grows faster than you think.** The database reaches multiple GB in weeks and the WAL follows it. Check `df -h` before maintenance like `VACUUM` — it needs free space roughly equal to the database size.
-- **GMGN rate limits are aggressive.** Don't push `GMGN_REQUEST_DELAY_MS` below 2500 unless you enjoy banned keys.
-- **pump.fun REST sits behind Cloudflare.** `403 Just a moment` is not rate limiting; retrying harder makes it worse. Use the sidecar.
-- **This is a personal setup, not a product.** No support, no roadmap, no guarantee it still works tomorrow. It is published because reading someone else's plumbing is the fastest way to fix your own.
+- **Paper fills are an estimate.** They use executable Jupiter quotes plus modelled fees and ATA rent, but not sandwiching, landing latency, priority fees or wallet state. Expect live to be worse.
+- **Jev thresholds need recalibration.** `llm_min_confidence` and `jev_max_rug` have different meanings than the old LLM settings; tune them in `dry_run` before going live.
+- **The free Jupiter budget limits concurrency.** At 1 RPS, more than about 3 open positions starves entries and enrichment. Exits are prioritised, so exits stay timely at the cost of everything else.
+- **Route quality changes over time.** A route that worked can decay. Judge routes by exit-reason breakdown and per-route results, not the total.
+- **GMGN rate limits are strict.** Do not set `GMGN_REQUEST_DELAY_MS` below 2500.
+- **Disk.** The database and WAL grow quickly under load; rotate logs and check free space before a `VACUUM`.
+- **Memecoins mostly go to zero.** This is a personal project with no support or guarantee, and not financial advice.
 
-## Security — credentials never go in this repo
+## Security
 
-- **No API keys, bot tokens, RPC keys, wallet private keys or seed phrases are committed here.** Everything sensitive is read from `.env`, which is `.gitignore`d.
-- `.env.example` contains **placeholders only** (`your_helius_key`, `123456:ABC-DEF...`). If you see something that looks real in this repo, treat it as leaked: rotate it, don't reuse it.
-- Wallet keys are only needed for `live`. Use a dedicated wallet funded with money you can afford to lose completely — never your main wallet.
-- Bundled scripts and the Cloudflare sidecar hold no credentials; the sidecar inherits nothing from `.env` and binds to loopback.
-- Database files (`*.sqlite`), logs (`*.log`) and render artifacts are gitignored — they hold trade history and potentially chat identifiers.
-- Before pushing your own fork, run: `git grep -nE "sk-[A-Za-z0-9]{20,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|PRIVATE_KEY *= *\["`
-
-## Credit
-
-Original project: [yunus-0x/charon](https://github.com/yunus-0x/charon). If you want upstream, that's the one. This fork is my personal trading setup, shared as-is.
+- Use a dedicated trading wallet funded with only what you can lose. Never use your main wallet.
+- Never commit `.env`; it is gitignored. `.env.example` holds placeholders only. If something real appears in the repo, treat it as leaked and rotate it.
+- `SOLANA_PRIVATE_KEY` is needed only for `confirm` and `live`. `dry_run` runs without any wallet key.
+- `*.sqlite` and `*.log` files contain trade history and chat identifiers and are gitignored.
+- Before pushing, scan for secrets: `git grep -nE "sk-[A-Za-z0-9]{20,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|PRIVATE_KEY *= *\["`
