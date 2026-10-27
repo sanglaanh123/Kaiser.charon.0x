@@ -1,7 +1,6 @@
-import { now } from '../utils.js';
-import { firstPositiveNumber } from '../utils.js';
+import { now, firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn } from '../utils.js';
 import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, jupiterAssetBackoffActive } from './jupiter.js';
-import { fetchGmgnTokenInfo, marketCapFromGmgn, tokenPriceFromGmgn } from './gmgn.js';
+import { fetchGmgnTokenInfo } from './gmgn.js';
 
 // Single entry point for token market data: Jupiter datapi first, GMGN as fallback,
 // returned in the Jupiter asset shape (plus `source`) so consumers don't care which.

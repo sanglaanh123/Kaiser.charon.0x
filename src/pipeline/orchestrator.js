@@ -5,7 +5,7 @@ import { numSetting, boolSetting, setting } from '../db/settings.js';
 import { db } from '../db/connection.js';
 import { upsertCandidate, updateCandidateStatus, recentEligibleCandidates, candidateById } from '../db/candidates.js';
 import { storeDecision, storeBatchDecision, logDecisionEvent, checkDecisionCache } from '../db/decisions.js';
-import { buildCandidate, filterCandidate, signalLabel } from './candidateBuilder.js';
+import { buildCandidate, filterCandidate, signalLabel, signalMarketSnapshot } from './candidateBuilder.js';
 import { preScoreCandidate } from './preScorer.js';
 import { momentumFilter } from './momentumFilter.js';
 import { decideCandidateBatch } from './llm.js';
@@ -117,8 +117,9 @@ export async function processCandidateFromSignals(signals) {
   }
 
   // FIX #1: Check decision cache BEFORE expensive buildCandidate() API calls
-  // Lightweight check with just mint — full enrichment happens only if cache miss
-  const cachedDecision = checkDecisionCache(signals.mint);
+  // Signal-provided mcap/holders (no network) drive the 20%/30% invalidation; unknown = cache honored as-is
+  const snap = signalMarketSnapshot(signals);
+  const cachedDecision = checkDecisionCache(signals.mint, snap.mcap, snap.holders);
   if (cachedDecision) {
     const ageMin = ((now() - cachedDecision.cachedAt) / 60000).toFixed(1);
     console.log(`[cache-hit] ${signals.mint.slice(0, 8)}... — verdict ${cachedDecision.verdict} (cached ${ageMin}m ago, reason: ${cachedDecision.reason?.slice(0, 60) || 'n/a'})`);

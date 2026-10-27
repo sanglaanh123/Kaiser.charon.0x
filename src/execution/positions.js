@@ -5,9 +5,9 @@ import { numSetting, boolSetting, strategyById, slippageAdjustedMcap } from '../
 import { db } from '../db/connection.js';
 import { firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn, computeAtrPercent, dynamicStopLossPercent } from '../utils.js';
 import { fetchGmgnTokenInfo } from '../enrichment/gmgn.js';
-import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote, fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
+import { fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote, fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { liveWalletPubkey } from '../liveExecutor.js';
-import { fetchChartContextCached, fetchTokenMarket } from '../enrichment/market.js';
+import { fetchChartContextCached, fetchTokenMarket, fetchHolders } from '../enrichment/market.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
 import { openPositions, positionValue } from '../db/positions.js';
@@ -17,8 +17,9 @@ import { executeLiveSell } from './router.js';
 import { sendPositionExit } from '../telegram/send.js';
 
 export async function freshEntryMarket(mint, candidate) {
-  const gmgn = await fetchGmgnTokenInfo(mint, false);
-  const asset = await fetchJupiterAsset(mint, { useCache: false });
+  const asset = await fetchTokenMarket(mint, { useCache: false, priority: 'entry' });
+  // Reuse the GMGN payload fetchTokenMarket just fetched when it fell back to GMGN.
+  const gmgn = await fetchGmgnTokenInfo(mint, asset?.source === 'gmgn');
   const priceUsd = firstPositiveNumber(tokenPriceFromGmgn(gmgn), asset?.usdPrice, candidate.metrics?.priceUsd);
   const marketCapUsd = firstPositiveNumber(
     marketCapFromGmgn(gmgn),
@@ -41,17 +42,18 @@ export async function refreshCandidateForExecution(row) {
   if (isFresh) {
     // Fast path: skip GMGN (Cloudflare blocked) and chart (no data for freshly graduated)
     [asset, holders] = await Promise.all([
-      fetchJupiterAsset(mint, { useCache: false }),
-      fetchJupiterHolders(mint),
+      fetchTokenMarket(mint, { useCache: false, priority: 'entry' }),
+      fetchHolders(mint),
     ]);
     gmgn = null;
     chart = null;
   } else {
-    [gmgn, asset, holders] = await Promise.all([
-      fetchGmgnTokenInfo(mint, false),
-      fetchJupiterAsset(mint, { useCache: false }),
-      fetchJupiterHolders(mint),
+    [asset, holders] = await Promise.all([
+      fetchTokenMarket(mint, { useCache: false, priority: 'entry' }),
+      fetchHolders(mint),
     ]);
+    // Cached when fetchTokenMarket already fell back to GMGN; fresh fetch otherwise.
+    gmgn = await fetchGmgnTokenInfo(mint, asset?.source === 'gmgn');
     chart = null;  // chart not used in buy path — saves 10s timeout
   }
   const selectedTrending = trending.get(mint) || candidate.trending || null;
@@ -93,6 +95,7 @@ export async function refreshCandidateForExecution(row) {
     },
     gmgn,
     jupiterAsset: asset,
+    marketSource: asset?.source || null,
     trending: selectedTrending,
     holders: selectedHolders,
     chart,

@@ -47,6 +47,19 @@ export function initDb() {
       risks_json TEXT NOT NULL,
       raw_json TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS decision_cache (
+      mint TEXT PRIMARY KEY,
+      verdict TEXT NOT NULL,
+      confidence REAL NOT NULL,
+      reason TEXT,
+      route TEXT,
+      created_at_ms INTEGER NOT NULL,
+      expires_at_ms INTEGER NOT NULL,
+      mcap_snapshot REAL,
+      holders_snapshot INTEGER,
+      liq_snapshot REAL
+    );
+    CREATE INDEX IF NOT EXISTS idx_decision_cache_expires ON decision_cache(expires_at_ms);
     CREATE TABLE IF NOT EXISTS llm_batches (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       created_at_ms INTEGER NOT NULL,

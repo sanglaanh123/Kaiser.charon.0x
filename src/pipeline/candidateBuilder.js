@@ -2,9 +2,9 @@ import { now, firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn, lamToS
 import { activeStrategy, numSetting } from '../db/settings.js';
 import { JUPITER_ASSET_FRESH_TTL_MS } from '../config.js';
 import { fetchGmgnTokenInfo } from '../enrichment/gmgn.js';
-import { fetchJupiterAsset, fetchJupiterHolders, fetchJupiterChartContext } from '../enrichment/jupiter.js';
+import { fetchJupiterChartContext } from '../enrichment/jupiter.js';
+import { fetchTokenMarket, fetchHolders } from '../enrichment/market.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
-import { fetchTwitterNarrative } from '../enrichment/twitter.js';
 import { gmgnLink } from '../format.js';
 import { effectivePositionSizeSol } from './llm.js';
 import { openPositionCount } from '../db/positions.js';
@@ -60,6 +60,7 @@ export function filterCandidate(candidate) {
     if (candidate.jupiterAsset === null || candidate.jupiterAsset === undefined) {
       reasons.push('no jupiterAsset');
     } else {
+      // GMGN-sourced assets carry no audit block; accept on liquidity + holders alone.
       const liquidityUsd = Number(candidate.jupiterAsset.liquidity ?? 0);
       const holderCount = Number(candidate.jupiterAsset.holderCount ?? 0);
       if (liquidityUsd === 0) reasons.push('liquidity=$0');
@@ -447,37 +448,76 @@ function globalOpenPositionCount() {
     return 0;
   }
 }
+// Market numbers already present on the signal payload (no network).
+export function signalMarketSnapshot({ graduatedCoin = null, trendingToken = null, trenchesEntry = null } = {}) {
+  const mcap = firstPositiveNumber(
+    trendingToken?.market_cap,
+    graduatedCoin?.marketCap,
+    graduatedCoin?.usd_market_cap,
+    trenchesEntry?.market_cap,
+    trenchesEntry?.marketCap,
+    trenchesEntry?.fdv,
+  );
+  const holders = firstPositiveNumber(
+    trendingToken?.holder_count,
+    graduatedCoin?.numHolders,
+    trenchesEntry?.holder_count,
+    trenchesEntry?.holderCount,
+  );
+  const liquidity = firstPositiveNumber(trendingToken?.liquidity, trenchesEntry?.liquidity);
+  return { mcap: mcap ?? null, holders: holders ?? null, liquidity: liquidity ?? null };
+}
+
+// Hard gates decidable from signal data alone; same thresholds as filterCandidate. Returns failure strings.
+export function cheapPrefilter(signals = {}) {
+  const strat = activeStrategy();
+  const { mcap, liquidity } = signalMarketSnapshot(signals);
+  const route = String(signals.route || '');
+  const freshGrad = route.includes('pumpportal_graduated') || route.includes('pumpfun_pregrad');
+  const failures = [];
+  // Signal numbers can lag the live market, so only reject clear misses (25% margin);
+  // filterCandidate still enforces the exact bounds on fresh data.
+  const SLACK = 1.25;
+  if (mcap != null) {
+    if (strat.max_mcap_usd > 0 && mcap > strat.max_mcap_usd * SLACK) failures.push(`market cap max: ${mcap} > ${strat.max_mcap_usd}`);
+    if (!freshGrad && strat.min_mcap_usd > 0 && mcap * SLACK < strat.min_mcap_usd) failures.push(`market cap min: ${mcap} < ${strat.min_mcap_usd}`);
+  }
+  const minLiquidityUsd = numSetting('min_liquidity_usd', 6000);
+  if (liquidity != null && liquidity * SLACK < minLiquidityUsd) {
+    failures.push(`DEX liquidity too low: $${liquidity.toFixed(0)} < $${minLiquidityUsd}`);
+  }
+  return failures;
+}
+
 export async function buildCandidate({ mint, fee = null, signature = null, graduatedCoin = null, trendingToken = null, trenchesEntry = null, pregradToken = null, route }) {
   const strat = activeStrategy();
   const isFreshlyGraduated = route === 'pumpportal_graduated';
 
-  let gmgn, jupiterAsset, holders, chart, savedWalletExposure, twitterNarrative;
+  let gmgn = null, jupiterAsset = null, holders, chart = null, savedWalletExposure;
 
-  if (isFreshlyGraduated) {
+  // Cheap gates first: skip every network call for candidates that already fail on signal data.
+  const prefilterFailures = cheapPrefilter({ mint, fee, graduatedCoin, trendingToken, trenchesEntry, pregradToken, route });
+
+  if (prefilterFailures.length) {
+    console.log(`[candidate] prefilter ${mint.slice(0, 8)}... ${prefilterFailures.join('; ')} (no enrichment)`);
+    holders = { count: 0, holders: [], top20: [], top20Percent: null, maxHolderPercent: null };
+    savedWalletExposure = { holderCount: 0, checked: 0, wallets: [] };
+  } else if (isFreshlyGraduated) {
     console.log(`[candidate] fast path for freshly graduated ${mint.slice(0, 8)}...`);
-    const [jupAsset, jupHolders] = await Promise.all([
-      fetchJupiterAsset(mint, { ttlMs: JUPITER_ASSET_FRESH_TTL_MS }),
-      fetchJupiterHolders(mint),
+    [jupiterAsset, holders] = await Promise.all([
+      fetchTokenMarket(mint, { ttlMs: JUPITER_ASSET_FRESH_TTL_MS, priority: 'enrich' }),
+      fetchHolders(mint),
     ]);
-    jupiterAsset = jupAsset;
-    holders = jupHolders;
-    gmgn = null;
-    chart = null;
-    twitterNarrative = null;
     savedWalletExposure = await fetchSavedWalletExposure(mint, holders);
   } else {
-    // Stage 1: parallel — gmgn, asset, holders, chart (4 calls)
-    [gmgn, jupiterAsset, holders, chart] = await Promise.all([
-      fetchGmgnTokenInfo(mint),
-      fetchJupiterAsset(mint),
-      fetchJupiterHolders(mint),
+    [jupiterAsset, holders, chart] = await Promise.all([
+      fetchTokenMarket(mint, { priority: 'enrich' }),
+      fetchHolders(mint),
       fetchJupiterChartContext(mint),
     ]);
-    // Stage 2: depends on stage 1 — wallet exposure (needs holders) + twitter (needs asset/gmgn)
-    [savedWalletExposure, twitterNarrative] = await Promise.all([
-      fetchSavedWalletExposure(mint, holders),
-      fetchTwitterNarrative(graduatedCoin || jupiterAsset, gmgn),
-    ]);
+    // Cache hit when fetchTokenMarket already fell back to GMGN, so no duplicate call.
+    gmgn = await fetchGmgnTokenInfo(mint);
+    savedWalletExposure = await fetchSavedWalletExposure(mint, holders);
   }
   const priceUsd = firstPositiveNumber(tokenPriceFromGmgn(gmgn), jupiterAsset?.usdPrice, trendingToken?.price, trenchesEntry?.price);
   const marketCapUsd = firstPositiveNumber(
@@ -545,12 +585,14 @@ export async function buildCandidate({ mint, fee = null, signature = null, gradu
     feeClaim: fee ? buildFeeSnapshot(fee, signature) : null,
     gmgn,
     jupiterAsset,
+    marketSource: jupiterAsset?.source || null,
     holders,
     chart,
     savedWalletExposure,
-    twitterNarrative,
     createdAtMs: now(),
   };
-  candidate.filters = filterCandidate(candidate);
+  candidate.filters = prefilterFailures.length
+    ? { passed: false, failures: prefilterFailures, strategy: strat.id, prefiltered: true }
+    : filterCandidate(candidate);
   return candidate;
 }

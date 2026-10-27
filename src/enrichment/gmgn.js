@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { GMGN_API_KEY, GMGN_CACHE_TTL_MS, GMGN_ENABLED, JSON_HEADERS } from '../config.js';
-import { now, sleep } from '../utils.js';
+import { now, sleep, marketCapFromGmgn, tokenPriceFromGmgn } from '../utils.js';
 import { numSetting, setting } from '../db/settings.js';
 
 const gmgnCache = new Map();
@@ -156,28 +156,6 @@ function gmgnStatusText(kind) {
   if (!gmgnBackoffActive(kind)) return 'ok';
   const seconds = Math.max(1, Math.ceil((Number(gmgnBackoff[key]) - now()) / 1000));
   return `blocked ${seconds}s`;
-}
-
-function gmgnPriceValue(info) {
-  // GMGN nests price under an object: price = { price: "0.0093", price_1m: ..., buys_1m: ... }
-  const raw = info?.price;
-  const candidate = raw && typeof raw === 'object' ? raw.price ?? raw.price_usd : raw;
-  const value = Number(candidate);
-  return Number.isFinite(value) && value > 0 ? value : null;
-}
-
-function marketCapFromGmgn(info) {
-  const direct = Number(info?.market_cap ?? info?.mcap);
-  if (Number.isFinite(direct) && direct > 0) return direct;
-  const price = gmgnPriceValue(info);
-  const supply = Number(info?.circulating_supply ?? info?.total_supply);
-  if (price && Number.isFinite(supply) && supply > 0) return price * supply;
-  const migrated = Number(info?.migration_market_cap);
-  return Number.isFinite(migrated) && migrated > 0 ? migrated : null;
-}
-
-function tokenPriceFromGmgn(info) {
-  return gmgnPriceValue(info);
 }
 
 async function fetchGmgnTokenInfo(mint, useCache = true) {
