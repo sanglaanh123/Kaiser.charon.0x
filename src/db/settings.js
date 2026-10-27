@@ -11,6 +11,11 @@ export function setSetting(key, value) {
   `).run(key, String(value));
 }
 
+// Route allowlist (setting allowed_routes, comma-separated). Empty = every route allowed.
+export function allowedRoutes() {
+  return String(setting('allowed_routes', '')).split(',').map(s => s.trim()).filter(Boolean);
+}
+
 export function boolSetting(key, fallback = false) {
   const value = setting(key, fallback ? 'true' : 'false');
   return value === 'true' || value === '1' || value === 'yes';

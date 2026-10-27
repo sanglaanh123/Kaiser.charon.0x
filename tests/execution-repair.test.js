@@ -16,7 +16,6 @@ const { refreshCandidateForExecution } = await import('../src/execution/position
 const { handleApprovedBuy } = await import('../src/pipeline/orchestrator.js');
 const { fetchJupiterAsset } = await import('../src/enrichment/jupiter.js');
 const { fetchGraduatedCoins, graduated } = await import('../src/signals/graduated.js');
-const { startOfficeBroker } = await import('../src/signals/officeBroker.js');
 const originalGet = axios.get;
 const base = JSON.parse(readFileSync(new URL('./fixtures/momentum-real.json', import.meta.url))).candidate;
 function row() {
@@ -45,9 +44,6 @@ test('refresh errors produce durable rejection, not stale-row entry attempt', as
  const event=db.prepare('select action from decision_logs order by id desc limit 1').get();
  assert.equal(event.action,'entry_rejected_refresh');
  assert.equal(db.prepare('select count(*) n from dry_run_positions').get().n,0);
-});
-test('Office socket remains disabled without explicit opt-in', () => {
- assert.equal(startOfficeBroker(),null);
 });
 test('graduation fallback includes only complete recent coins, not old active ones', async () => {
  axios.get=async url => {

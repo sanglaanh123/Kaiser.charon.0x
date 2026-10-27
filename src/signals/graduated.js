@@ -115,34 +115,6 @@ export async function fetchGraduatedCoins() {
   }
 }
 
-export async function fetchLatestPumpCoins(limit = 50) {
-  try {
-    const res = await axios.get(`https://advanced-api-v2.pump.fun/coins/latest?limit=${limit}`, {
-      timeout: 10_000,
-      headers: JSON_HEADERS,
-    });
-    const coins = Array.isArray(res.data?.coins) ? res.data.coins : [];
-    const cutoff = now() - GRADUATED_LOOKBACK_MS;
-    let added = 0;
-    for (const coin of coins) {
-      const mint = coin?.coinMint || coin?.mint;
-      if (!mint) continue;
-      const createdAt = Number(coin.created_timestamp || coin.createdAt || 0);
-      if (createdAt > 0 && createdAt < cutoff) continue;
-      if (!watchedMints.has(mint)) {
-        watchedMints.set(mint, { addedAt: now(), source: 'pump_latest' });
-        added++;
-      }
-    }
-    for (const [mint, entry] of watchedMints) {
-      if (Number(entry.addedAt || 0) < cutoff) watchedMints.delete(mint);
-    }
-    if (added > 0) console.log(`[graduated] watching ${added} new pump mints (total ${watchedMints.size})`);
-  } catch (err) {
-    console.log(`[graduated] pump.latest fetch failed: ${err.message}`);
-  }
-}
-
 export async function pollGraduationStatus() {
   if (gmgnBackoffActive('token')) return;
   if (!boolSetting('graduation_polling_enabled', true)) return;
@@ -195,7 +167,6 @@ const graduationCycle = singleFlight(pollLoop);
 
 async function pollLoop() {
   try {
-    // fetchLatestPumpCoins removed — endpoint /coins/latest returns 404
     // Only poll GMGN token/info for mints already in graduated map
     await pollGraduationStatus();
   } catch (err) {
@@ -210,7 +181,6 @@ export function startGraduationPolling() {
     return;
   }
   graduationCycle().catch(err => handleGraduationPollError(err));
-  // fetchLatestPumpCoins removed — endpoint /coins/latest returns 404
   pollTimer = setInterval(() => graduationCycle().catch(err => handleGraduationPollError(err)), GRADUATED_POLL_MS);
   console.log(`[graduated] polling started (interval ${GRADUATED_POLL_MS}ms)`);
 }

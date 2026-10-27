@@ -122,7 +122,7 @@ Ngumpulin candidate sampe `llm_candidate_pick_count` atau `llm_candidate_max_age
 
 Cache: BUY decisions gak diproses ulang dalam 10 menit, WATCH/PASS dalam 60 menit. Invalidasi kalo mcap berubah >20% atau holders >30%.
 
-Blocked routes: `dual_source`, `fee_graduated_trending`, `graduated_trending` (Lesson #3 — consistently unprofitable).
+Route gate: setting `allowed_routes` (comma-separated, empty = all) is the single source of truth. Default excludes `dual_source`, `fee_graduated_trending`, `pumpfun_pregrad`, `graduated_trending` (Lesson #3 — consistently unprofitable).
 
 ### 6. Position Creation
 - **Dry run**: `dry_run_positions` table, simulate buy + track HWM

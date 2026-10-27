@@ -161,9 +161,6 @@ function setJupiterAssetBackoff(err) {
   if (status === 429 || status === 403) noteResponse('datapi', buckets.datapi, err.response.headers, status);
 }
 
-const quoteSnapshotCache = new Map();
-const QUOTE_SNAPSHOT_MS = 10_000;
-
 let solUsdCache = { price: null, at: 0 };
 
 function jupiterStatsForInterval(row, interval) {
@@ -341,12 +338,6 @@ async function fetchJupiterChartContext(mint) {
   };
 }
 
-const IGNORED_PNL_MINTS = new Set([
-  'So11111111111111111111111111111111111111111',
-  'So11111111111111111111111111111111111111112',
-  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
-]);
-
 // SOL/USD moves a few tenths of a percent per minute, so re-fetching it for every
 // entry and every monitored position only burned rate-limit budget — and when the
 // fetch failed the entry died as `missing_decimals_or_sol_price` even though the
@@ -397,45 +388,6 @@ export async function fetchJupiterExecutionQuote({ inputMint, outputMint, amount
   return jupiterQuote({ inputMint, outputMint, amount, slippageBps: 100 }, 'execution', 3, { priority: opts?.priority || 'entry' });
 }
 
-async function fetchTokenSpotViaQuote(mint, decimals = 9, { priority = 'entry' } = {}) {
-  const normalizedDecimals = Number.isFinite(Number(decimals)) ? Math.max(0, Math.min(18, Number(decimals))) : 9;
-  const cacheKey = `${mint}:${normalizedDecimals}`;
-  const cached = quoteSnapshotCache.get(cacheKey);
-  if (cached && now() - cached.at < QUOTE_SNAPSHOT_MS) return cached.priceUsd;
-  try {
-    const tokenUnits = 1000 * (10 ** normalizedDecimals);
-    const [solUsd, quoteRes] = await Promise.all([
-      fetchSolUsdPriceCached(),
-      jupiterQuote({ inputMint: mint, outputMint: WSOL_MINT, amount: Math.round(tokenUnits), slippageBps: 100 }, mint.slice(0, 8), 2, { priority }),
-    ]);
-    const outAmount = quoteRes?.outAmount;
-    if (!outAmount) return null;
-    const outSol = Number(outAmount) / 1e9;
-    if (!Number.isFinite(solUsd) || solUsd <= 0) return null;
-    const priceUsd = (outSol / 1000) * solUsd;
-    quoteSnapshotCache.set(cacheKey, { at: now(), priceUsd });
-    return priceUsd;
-  } catch (err) {
-    if (err.response?.status !== 429) console.log(`[quote] ${mint.slice(0, 8)}... ${err.response?.status || ''} ${err.message}`);
-    return null;
-  }
-}
-
-async function fetchJupiterWalletPnl(walletAddress) {
-  try {
-    const url = new URL('https://datapi.jup.ag/v1/pnl');
-    url.searchParams.set('addresses', walletAddress);
-    url.searchParams.set('includeClosed', 'false');
-    const res = await jupiterFetch(url.toString(), { bucket: 'datapi' });
-    const data = res.data?.[walletAddress] || {};
-    for (const mint of IGNORED_PNL_MINTS) delete data[mint];
-    return data;
-  } catch (err) {
-    console.log(`[pnl] ${err.response?.status || ''} ${err.message}`);
-    return {};
-  }
-}
-
 export {
   jupiterStatsForInterval,
   normalizeJupiterTrendingRow,
@@ -447,8 +399,6 @@ export {
   summarizeCandles,
   fetchJupiterChartWindow,
   fetchJupiterChartContext,
-  fetchJupiterWalletPnl,
-  fetchTokenSpotViaQuote,
   jupiterAssetBackoffActive,
   setJupiterAssetBackoff,
 };

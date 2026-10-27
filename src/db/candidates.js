@@ -1,6 +1,6 @@
 import { db } from './connection.js';
 import { now, safeJson, json } from '../utils.js';
-import { numSetting } from './settings.js';
+import { numSetting, allowedRoutes } from './settings.js';
 
 export function candidateSignalKey(candidate, signature = null) {
   const route = candidate.signals?.route || 'signal';
@@ -74,10 +74,12 @@ export function latestCandidateByMint(mint) {
 export function recentEligibleCandidates(limit = 10) {
   const maxAgeMs = numSetting('llm_candidate_max_age_ms', 10 * 60 * 1000);
   const cutoff = now() - Math.max(30_000, maxAgeMs);
-  // Lesson #3: block unprofitable routes at query level — prevents blocked routes from drowning out profitable ones
-  // pumpfun_pregrad: pre-grad tokens still on bonding curve, can't reliably trade yet — keep for data only
-  const BLOCKED_ROUTES = ['dual_source', 'fee_graduated_trending', 'pumpfun_pregrad', 'graduated_trending'];
-  const blockedClause = BLOCKED_ROUTES.map(r => `signal_key NOT LIKE '${r}:%'`).join(' AND ');
+  // allowed_routes is the single route gate; filtered in SQL so disallowed routes can't crowd out allowed ones.
+  // Disallowed candidates (e.g. pumpfun_pregrad) stay stored for data. Empty allowlist = all routes.
+  const allowed = allowedRoutes();
+  const routeClause = allowed.length
+    ? `substr(signal_key, 1, instr(signal_key || ':', ':') - 1) IN (${allowed.map(() => '?').join(',')})`
+    : '1=1';
   const rows = db.prepare(`
     SELECT c.*
     FROM candidates c
@@ -87,7 +89,7 @@ export function recentEligibleCandidates(limit = 10) {
       WHERE status IN ('candidate', 'watch', 'buy', 'pass')
         AND created_at_ms >= ?
         AND id NOT IN (SELECT COALESCE(candidate_id, -1) FROM dry_run_positions WHERE status = 'open')
-        AND ${blockedClause}
+        AND ${routeClause}
         AND (
           json_extract(candidate_json, '$.filters.passed') IS NULL
           OR json_extract(candidate_json, '$.filters.passed') = 1
@@ -96,6 +98,6 @@ export function recentEligibleCandidates(limit = 10) {
     ) latest ON c.id = latest.max_id
     ORDER BY c.id DESC
     LIMIT ?
-  `).all(cutoff, limit);
+  `).all(cutoff, ...allowed, limit);
   return rows.map(row => ({ ...row, candidate: safeJson(row.candidate_json, {}) })).reverse();
 }

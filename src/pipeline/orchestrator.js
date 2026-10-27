@@ -1,7 +1,7 @@
 import { updateCandidateSnapshot } from '../db/candidates.js';
 import { paperAudit } from '../db/paperAudit.js';
-import { now, pruneSeen } from '../utils.js';
-import { numSetting, boolSetting, setting } from '../db/settings.js';
+import { now } from '../utils.js';
+import { numSetting, boolSetting, allowedRoutes } from '../db/settings.js';
 import { db } from '../db/connection.js';
 import { upsertCandidate, updateCandidateStatus, recentEligibleCandidates, candidateById } from '../db/candidates.js';
 import { storeDecision, storeBatchDecision, logDecisionEvent, checkDecisionCache } from '../db/decisions.js';
@@ -16,9 +16,8 @@ import { candidateSummary } from '../telegram/format.js';
 import { createTradeIntent } from '../db/intents.js';
 import { refreshCandidateForExecution } from '../execution/positions.js';
 import { executeLiveBuy } from '../execution/router.js';
-import { graduated } from '../signals/graduated.js';
-import { setDegenHandler } from '../signals/trending.js';
 import { setCandidateHandler } from '../signals/feeClaim.js';
+import { storeSignalEvent } from '../signals/trending.js';
 import { short } from '../format.js';
 import { escapeHtml } from '../format.js';
 
@@ -35,19 +34,19 @@ const EXPECTED_ENTRY_REJECTIONS = new Set([
   'paper_mode_or_position_limit_changed',
 ]);
 
-setDegenHandler(maybeProcessDegenCandidate);
 setCandidateHandler(processCandidateFromSignals);
 
 // Route allowlist — settings.allowed_routes (comma-separated). Empty = every route allowed.
 export function routeAllowed(route) {
-  const allowed = String(setting('allowed_routes', ''))
-    .split(',').map(s => s.trim()).filter(Boolean);
+  const allowed = allowedRoutes();
   return allowed.length === 0 || allowed.includes(String(route || ''));
 }
 
 export async function processCandidateFromSignals(signals) {
   if (!routeAllowed(signals.route)) {
     console.log(`[agent] route "${signals.route}" not in allowed_routes — skipping ${signals.mint.slice(0, 8)}...`);
+    // Data-only: keep the raw signal for backtests without spending enrichment calls.
+    storeSignalEvent(signals.mint, 'route_blocked', signals.route || 'unknown', signalMarketSnapshot(signals));
     return;
   }
 
@@ -461,21 +460,4 @@ export async function handleApprovedBuy(selectedRow, decision, batchId, rows = [
       `Error: ${escapeHtml(err.message)}`,
     ].join('\n'));
   }
-}
-
-export async function maybeProcessDegenCandidate(mint, trendingToken) {
-  if (!boolSetting('trending_allow_degen', false)) return;
-  const graduatedCoin = graduated.get(mint);
-  if (!graduatedCoin) return;
-  pruneSeen(seenSignalCandidates, 10 * 60 * 1000);
-  const bucket = Math.floor(now() / (5 * 60 * 1000));
-  const key = `graduated_trending:${mint}:${bucket}`;
-  if (seenSignalCandidates.has(key)) return;
-  seenSignalCandidates.set(key, now());
-  await processCandidateFromSignals({
-    mint,
-    graduatedCoin,
-    trendingToken,
-    route: 'graduated_trending',
-  });
 }

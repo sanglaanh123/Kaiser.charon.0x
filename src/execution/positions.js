@@ -5,8 +5,7 @@ import { numSetting, boolSetting, strategyById, slippageAdjustedMcap } from '../
 import { db } from '../db/connection.js';
 import { firstPositiveNumber, marketCapFromGmgn, tokenPriceFromGmgn, computeAtrPercent, dynamicStopLossPercent } from '../utils.js';
 import { fetchGmgnTokenInfo } from '../enrichment/gmgn.js';
-import { fetchJupiterChartContext, fetchJupiterWalletPnl, fetchTokenSpotViaQuote, fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
-import { liveWalletPubkey } from '../liveExecutor.js';
+import { fetchJupiterChartContext, fetchJupiterExecutionQuote, fetchSolUsdPriceCached } from '../enrichment/jupiter.js';
 import { fetchChartContextCached, fetchTokenMarket, fetchHolders } from '../enrichment/market.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { filterCandidate } from '../pipeline/candidateBuilder.js';
@@ -149,7 +148,7 @@ function paperNet(entryLamports, outLamports, realizedPartialSol) {
   });
 }
 
-export async function refreshPosition(position, { autoExit = true, jupiterPnl = null } = {}) {
+export async function refreshPosition(position, { autoExit = true } = {}) {
   // Bug2 fix (2026-06-19): bypass 20s cache for live monitoring — flash crash detection requires fresh data
   // Quote-first: dry and live decisions share the same 10s per-mint executable quote snapshot.
   // Wallet-PnL remains telemetry only; it must not alter exit decisions.
@@ -454,16 +453,8 @@ export async function refreshPosition(position, { autoExit = true, jupiterPnl = 
 
 export async function monitorPositions() {
   const positions = openPositions();
-  let walletPnlData = {};
-  const pubkey = liveWalletPubkey();
-  if (pubkey && positions.some(p => p.execution_mode === 'live')) {
-    walletPnlData = await fetchJupiterWalletPnl(pubkey);
-  }
   for (const position of positions) {
-    const jupiterPnl = position.execution_mode === 'live'
-      ? (walletPnlData[position.mint]?.pnl || null)
-      : null;
-    const result = await refreshPosition(position, { autoExit: true, jupiterPnl }).catch((err) => {
+    const result = await refreshPosition(position, { autoExit: true }).catch((err) => {
       console.log(`[position] ${position.id} ${err.message}`);
       return null;
     });

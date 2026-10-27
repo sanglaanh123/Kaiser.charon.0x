@@ -6,12 +6,7 @@ import { gmgnBackoffActive, setGmgnBackoff, gmgnFetch, normalizedTrendingRows } 
 import { normalizeJupiterTrendingRow, jupiterFetch } from '../enrichment/jupiter.js';
 
 export const trending = new Map();
-let degenHandler = null;
 let trendingCandidateHandler = null;
-
-export function setDegenHandler(fn) {
-  degenHandler = fn;
-}
 
 export function setTrendingCandidateHandler(fn) {
   trendingCandidateHandler = fn;
@@ -100,9 +95,23 @@ export async function fetchGmgnTrending() {
   const source = setting('trending_source', 'jupiter');
 
   try {
-    const rows = source === 'gmgn'
-      ? await fetchGmgnTrendingRows(interval, Math.min(100, limit))
-      : await fetchJupiterTrendingRows(interval, limit);
+    let rows;
+    if (source === 'gmgn') {
+      rows = await fetchGmgnTrendingRows(interval, Math.min(100, limit));
+    } else {
+      // Jupiter primary; on error / JUP_DEADLINE / empty fall back to GMGN rank for this cycle.
+      try {
+        rows = await fetchJupiterTrendingRows(interval, limit);
+      } catch (err) {
+        console.log(`[trending:jupiter] ${err.code || err.response?.status || ''} ${err.message} — falling back to gmgn`);
+        rows = [];
+      }
+      if (!rows.length) rows = await fetchGmgnTrendingRows(interval, Math.min(100, limit)).catch(err => {
+        setGmgnBackoff('trending', err);
+        console.log(`[trending:gmgn] fallback failed: ${err.message}`);
+        return [];
+      });
+    }
     const seenAt = now();
     const cutoff = seenAt - TRENDING_LOOKBACK_MS;
     for (const [mint, token] of trending) {
@@ -122,7 +131,6 @@ export async function fetchGmgnTrending() {
       trending.set(mint, token);
       tracked++;
       storeSignalEvent(mint, 'trending', token.source || source, token);
-      if (degenHandler) await degenHandler(mint, token);
       if (trendingCandidateHandler) {
         trendingCandidateHandler({ mint, trendingToken: token, route: 'trending' }).catch(err =>
           console.log(`[trending] candidate trigger failed for ${mint.slice(0, 8)}: ${err.message}`),

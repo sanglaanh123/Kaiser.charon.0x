@@ -49,7 +49,7 @@ export const LLM_FALLBACK_MODEL = process.env.LLM_FALLBACK_MODEL || '';
 
 export const GRADUATED_POLL_MS = Number(process.env.GRADUATED_POLL_MS || 30_000);
 export const GRADUATED_LOOKBACK_MS = Number(process.env.GRADUATED_LOOKBACK_MS || 2 * 60 * 60 * 1000);
-export const TRENDING_POLL_MS = Number(process.env.TRENDING_POLL_MS || 60_000);
+export const TRENDING_POLL_MS = Math.max(60_000, Number(process.env.TRENDING_POLL_MS) || 60_000);
 export const TRENDING_LOOKBACK_MS = Number(process.env.TRENDING_LOOKBACK_MS || 10 * 60 * 1000);
 export const GMGN_CACHE_TTL_MS = Number(process.env.GMGN_CACHE_TTL_MS || 5 * 60 * 1000);
 export const POSITION_CHECK_MS = Number(process.env.POSITION_CHECK_MS || 10_000);
@@ -61,6 +61,10 @@ export const SIGNAL_SERVER_KEY = process.env.SIGNAL_SERVER_KEY || '';
 export const SIGNAL_POLL_MS = Number(process.env.SIGNAL_POLL_MS || 30_000);
 export const PUMPPORTAL_API_KEY = process.env.PUMPPORTAL_API_KEY || '';
 export const PUMPPORTAL_ENABLED = process.env.PUMPPORTAL_ENABLED !== 'false';
+// On-chain fee-claim WS listener. Default on when a WS endpoint is available (SOLANA_WS_URL or HELIUS_API_KEY).
+export const FEE_CLAIM_WS_ENABLED = process.env.FEE_CLAIM_WS_ENABLED
+  ? process.env.FEE_CLAIM_WS_ENABLED !== 'false'
+  : Boolean(process.env.SOLANA_WS_URL || HELIUS_API_KEY);
 export const PREGRAD_POLL_MS = Number(process.env.PREGRAD_POLL_MS || 12_000);
 export const PREGRAD_LOOKBACK_MS = Number(process.env.PREGRAD_LOOKBACK_MS || 30 * 60 * 1000);
 export const PREGRAD_ENABLED = process.env.PREGRAD_ENABLED !== 'false';

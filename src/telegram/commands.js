@@ -28,7 +28,6 @@ import { executeLiveSell } from '../execution/router.js';
 import { handleCallback, editMenuMessage } from './callbacks.js';
 import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
-import { fetchWalletPnl } from '../enrichment/wallets.js';
 import { sendDailyReport } from './dailyReport.js';
 
 export async function handleMessage(msg) {
@@ -281,26 +280,39 @@ async function sendMenu(chatId = TELEGRAM_CHAT_ID) {
   });
 }
 
+// Realised PnL from our own closed positions (live vs paper split).
+export function pnlSummary() {
+  const rows = db.prepare(`
+    SELECT COALESCE(execution_mode, 'paper') AS mode, COUNT(*) AS n,
+           SUM(CASE WHEN pnl_sol > 0 THEN 1 ELSE 0 END) AS wins,
+           COALESCE(SUM(pnl_sol), 0) AS pnl_sol, AVG(pnl_percent) AS avg_pct
+    FROM dry_run_positions WHERE status = 'closed' GROUP BY 1
+  `).all();
+  const sum = list => {
+    const n = list.reduce((a, r) => a + r.n, 0);
+    const wins = list.reduce((a, r) => a + r.wins, 0);
+    const pnlSol = list.reduce((a, r) => a + r.pnl_sol, 0);
+    const avgPct = n ? list.reduce((a, r) => a + (r.avg_pct || 0) * r.n, 0) / n : 0;
+    return { n, wins, winRate: n ? (wins / n) * 100 : 0, pnlSol, avgPct };
+  };
+  return {
+    all: sum(rows),
+    live: sum(rows.filter(r => r.mode === 'live')),
+    paper: sum(rows.filter(r => r.mode !== 'live')),
+  };
+}
+
 async function sendPnl(chatId, query = null) {
-  const wallets = savedWallets();
-  if (!wallets.length) {
-    const text = '📊 <b>PnL</b>\n\nNo saved wallets. Use /walletadd &lt;label&gt; &lt;address&gt;.';
-    return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-  }
-  const chunks = [];
-  for (const wallet of wallets) {
-    const pnl = await fetchWalletPnl(wallet.address).catch(() => null);
-    if (!pnl) {
-      chunks.push(`• <b>${escapeHtml(wallet.label)}</b>: no data`);
-      continue;
-    }
-    chunks.push([
-      `• <b>${escapeHtml(wallet.label)}</b>`,
-      `Win: ${fmtPct(pnl.winRate)} · PnL: ${fmtPct(pnl.totalPnlPercent)}`,
-      `Trades: ${pnl.totalTrades} · Wins: ${pnl.wins}`,
-    ].join('\n'));
-  }
-  const text = `📊 <b>PnL</b>\n\n${chunks.join('\n\n')}`;
+  const s = pnlSummary();
+  const line = (label, x) => `• <b>${label}</b>: ${x.n} closed · wins ${x.wins} (${fmtPct(x.winRate)}) · PnL ${x.pnlSol.toFixed(4)} SOL · avg ${fmtPct(x.avgPct)}`;
+  const text = s.all.n
+    ? `📊 <b>PnL</b>
+
+${[line('All', s.all), line('Live', s.live), line('Paper', s.paper)].join('
+')}`
+    : '📊 <b>PnL</b>
+
+No closed positions yet.';
   return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 
@@ -313,6 +325,3 @@ function allPositions(limit = 10) {
   return db.prepare('SELECT * FROM dry_run_positions ORDER BY id DESC LIMIT ?').all(limit);
 }
 
-function savedWallets() {
-  return db.prepare('SELECT * FROM saved_wallets ORDER BY label').all();
-}

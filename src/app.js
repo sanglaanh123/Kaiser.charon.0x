@@ -1,10 +1,10 @@
 import { setDefaultResultOrder } from 'node:dns';
-import { APP_NAME, SIGNAL_SERVER_URL, SIGNAL_POLL_MS, POSITION_CHECK_MS, PUMPPORTAL_API_KEY, PUMPPORTAL_ENABLED, PREGRAD_ENABLED, TRENDING_POLL_MS, validateConfig } from './config.js';
+import { APP_NAME, SIGNAL_SERVER_URL, SIGNAL_POLL_MS, POSITION_CHECK_MS, PUMPPORTAL_API_KEY, PUMPPORTAL_ENABLED, PREGRAD_ENABLED, TRENDING_POLL_MS, FEE_CLAIM_WS_ENABLED, validateConfig } from './config.js';
 import { initDb } from './db/connection.js';
 import { initLiveExecution } from './liveExecutor.js';
 import { setupTelegram } from './telegram/commands.js';
 import { monitorPositions } from './execution/positions.js';
-import { processCandidateFromSignals, maybeProcessDegenCandidate } from './pipeline/orchestrator.js';
+import { processCandidateFromSignals } from './pipeline/orchestrator.js';
 import { sendTelegram } from './telegram/send.js';
 import { makeFailureTracker } from './utils.js';
 import { singleFlight } from './utils/singleFlight.js';
@@ -19,10 +19,9 @@ export async function startCharon() {
 
   if (SIGNAL_SERVER_URL) {
     // ── Server mode: fetch signals from signal server ──────────────────────
-    const { fetchServerSignals, setCandidateHandler, setDegenHandler } = await import('./signals/serverClient.js');
+    const { fetchServerSignals, setCandidateHandler } = await import('./signals/serverClient.js');
 
     setCandidateHandler(processCandidateFromSignals);
-    setDegenHandler(maybeProcessDegenCandidate);
 
     const alert = (msg) => sendTelegram(msg);
     const trackServer = makeFailureTracker('server signals', alert);
@@ -77,7 +76,16 @@ export async function startCharon() {
   const trackTrending = makeFailureTracker('trending poll', (msg) => sendTelegram(msg));
   const trendingCycle = singleFlight(fetchGmgnTrending);
   trendingCycle().catch(err => console.log(`[trending] initial fetch failed: ${err.message}`));
-  setInterval(() => trackTrending(trendingCycle), TRENDING_POLL_MS);
+  setInterval(() => trackTrending(trendingCycle), Math.max(60_000, TRENDING_POLL_MS));
+
+  // On-chain fee-claim listener (signal-server fee claims are handled in serverClient)
+  if (FEE_CLAIM_WS_ENABLED) {
+    const { startWebsocket, setCandidateHandler: setFeeHandler } = await import('./signals/feeClaim.js');
+    setFeeHandler(processCandidateFromSignals);
+    startWebsocket();
+  } else {
+    console.log('[fee] WS listener off — only signal-server fee claims active');
+  }
 
   if (PREGRAD_ENABLED) {
     const { startPumpfunPregrad, setCandidateHandler: setPregradHandler } = await import('./signals/pumpfunPregrad.js');

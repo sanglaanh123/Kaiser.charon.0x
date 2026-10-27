@@ -8,7 +8,21 @@ import { trending } from './trending.js';
 import { buildFeeSnapshot } from '../pipeline/candidateBuilder.js';
 
 export const seenFeeClaims = new Map();
+const FEE_SEEN_TTL_MS = 10 * 60 * 1000;
+const WS_RECONNECT_MIN_MS = 5_000;
+const WS_RECONNECT_MAX_MS = 60_000;
+const WS_ALERT_AFTER_MS = 10 * 60 * 1000;
 let candidateHandler = null;
+
+// Shared dedup across signal-server and on-chain WS inputs. Returns false if already seen.
+export function markFeeClaimSeen(signature, mint) {
+  if (!signature || !mint) return true;
+  pruneSeen(seenFeeClaims, FEE_SEEN_TTL_MS);
+  const key = `${signature}:${mint}`;
+  if (seenFeeClaims.has(key)) return false;
+  seenFeeClaims.set(key, now());
+  return true;
+}
 
 export function setCandidateHandler(fn) {
   candidateHandler = fn;
@@ -21,10 +35,7 @@ export async function handleFeeClaim(fee, signature) {
   const trendingToken = boolSetting('trending_enabled', true) ? trending.get(fee.mint) || null : null;
   if (!graduatedCoin && !trendingToken) return;
 
-  const key = `${signature}:${fee.mint}:${fee.distributed}`;
-  pruneSeen(seenFeeClaims, 10 * 60 * 1000);
-  if (seenFeeClaims.has(key)) return;
-  seenFeeClaims.set(key, now());
+  if (!markFeeClaimSeen(signature, fee.mint)) return;
   storeSignalEvent(fee.mint, 'fee_claim', 'pump_logs', { signature, fee: buildFeeSnapshot(fee, signature) });
   const route = graduatedCoin && trendingToken
     ? 'fee_graduated_trending'
@@ -43,7 +54,7 @@ export async function handleFeeClaim(fee, signature) {
   }
 }
 
-async function processLog(logInfo) {
+export async function processLog(logInfo) {
   const { signature, logs, err } = logInfo;
   if (err || !logs) return;
   for (const line of logs) {
@@ -63,14 +74,35 @@ async function processLog(logInfo) {
   }
 }
 
+async function alertTelegram(text) {
+  try {
+    const { sendTelegram } = await import('../telegram/send.js');
+    await sendTelegram(text);
+  } catch (error) {
+    console.log(`[fee] telegram alert failed: ${error.message}`);
+  }
+}
+
 export function startWebsocket() {
   const wsUrl = SOLANA_WS_URL;
   let ws;
   let pingTimer;
+  let retryTimer;
+  let alertTimer;
+  let delay = WS_RECONNECT_MIN_MS;
+  let alerted = false;
+  let down = false;
   function connect() {
     ws = new WebSocket(wsUrl);
     ws.on('open', () => {
       console.log('[ws] connected');
+      delay = WS_RECONNECT_MIN_MS;
+      down = false;
+      clearTimeout(alertTimer);
+      if (alerted) {
+        alerted = false;
+        alertTelegram('✅ <b>Fee-claim WS reconnected</b>');
+      }
       for (const [id, program] of [[1, PUMP_PROGRAM], [2, PUMP_AMM]]) {
         ws.send(JSON.stringify({
           jsonrpc: '2.0',
@@ -97,10 +129,29 @@ export function startWebsocket() {
     });
     ws.on('close', () => {
       clearInterval(pingTimer);
-      console.log('[ws] closed, reconnecting in 5s');
-      setTimeout(connect, 5000);
+      if (!down) {
+        down = true;
+        alertTimer = setTimeout(() => {
+          if (!down || alerted) return;
+          alerted = true;
+          alertTelegram('🚨 <b>Fee-claim WS down >10min</b> — on-chain fee claims missed; signal-server claims still active.');
+        }, WS_ALERT_AFTER_MS);
+        alertTimer.unref?.();
+      }
+      console.log(`[ws] closed, reconnecting in ${Math.round(delay / 1000)}s`);
+      retryTimer = setTimeout(connect, delay);
+      delay = Math.min(delay * 2, WS_RECONNECT_MAX_MS);
     });
     ws.on('error', error => console.log(`[ws] ${error.message}`));
   }
   connect();
+  return {
+    stop() {
+      clearTimeout(retryTimer);
+      clearTimeout(alertTimer);
+      clearInterval(pingTimer);
+      ws?.removeAllListeners();
+      ws?.terminate?.();
+    },
+  };
 }

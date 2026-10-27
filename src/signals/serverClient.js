@@ -4,12 +4,11 @@ import { now } from '../utils.js';
 import { activeStrategy, boolSetting } from '../db/settings.js';
 import { storeSignalEvent, trendingSignalPass, trending } from './trending.js';
 import { graduated } from './graduated.js';
+import { markFeeClaimSeen } from './feeClaim.js';
 
 let candidateHandler = null;
-let degenHandler = null;
 
 export function setCandidateHandler(fn) { candidateHandler = fn; }
-export function setDegenHandler(fn) { degenHandler = fn; }
 
 const seenSignals = new Map();
 
@@ -123,6 +122,7 @@ export async function fetchServerSignals() {
       if (hasFee && graduatedCoin && trendingToken) route = 'fee_graduated_trending';
       else if (hasFee && graduatedCoin) route = 'fee_graduated';
       else if (hasFee && trendingToken) route = 'fee_trending';
+      // Kept as its own route so the allowlist keeps blocking it (consistently unprofitable).
       else if (graduatedCoin && trendingToken) route = 'graduated_trending';
       else if (sourceCount >= 3) route = 'multi_source';
       else if (sourceCount >= 2) route = 'dual_source';
@@ -142,6 +142,9 @@ export async function fetchServerSignals() {
         };
         signature = signal.feeClaim.signature;
       }
+
+      // One fee claim must not run the pipeline twice (server + on-chain WS inputs)
+      if (signature && !markFeeClaimSeen(signature, mint)) { processed++; continue; }
 
       // Entry mode logic
       if (strat.entry_mode === 'wait_for_dip' && strat.max_ath_distance_pct < 0) {

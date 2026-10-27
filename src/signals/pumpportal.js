@@ -1,5 +1,3 @@
-import { officeBroker, startOfficeBroker } from './officeBroker.js';
-import { publishOfficeDiscovery } from './officeFeed.js';
 import WebSocket from 'ws';
 import { PUMPPORTAL_API_KEY, PUMPPORTAL_ENABLED } from '../config.js';
 import { now, sleep } from '../utils.js';
@@ -302,8 +300,6 @@ function onMessage(raw) {
   let payload;
   try {
     payload = JSON.parse(raw);
-    publishOfficeDiscovery(payload);
-    officeBroker.publish(payload);
   } catch {
     return;
   }
@@ -390,7 +386,6 @@ function onOpen() {
   ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   // Also subscribe to migration in case PumpPortal re-enables it
   ws.send(JSON.stringify({ method: 'subscribeMigration' }));
-  officeBroker.attach(ws);
 }
 
 function connect() {
@@ -405,7 +400,6 @@ function connect() {
   });
 
   ws.on('close', (code, reason) => {
-    officeBroker.disconnect();
     console.log(`[pumpportal] disconnected (code=${code})`);
     if (lastDisconnectAt === null) {
       lastDisconnectAt = now();
@@ -429,14 +423,12 @@ export function startPumpportal() {
     return;
   }
   stopped = false;
-  startOfficeBroker();
   startMonitor();
   startHealthMonitor();
   connect();
 }
 
 export function stopPumpportal() {
-  officeBroker.disconnect();
   stopped = true;
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);

@@ -15,20 +15,11 @@ function llmBuyMinConfidence() {
 }
 function llmLowConfidenceCap() { return numSetting('llm_low_confidence_cap', 70); }
 
-// Lesson #3: dual_source and graduated_trending consistently lose money — disable them
-const BLOCKED_ROUTES = ['dual_source', 'fee_graduated_trending', 'graduated_trending'];
-
 export function normalizeDecision(parsed, fallbackReason = '', route = '') {
   let verdict = ['BUY', 'WATCH', 'PASS'].includes(String(parsed?.verdict).toUpperCase())
     ? String(parsed.verdict).toUpperCase()
     : 'WATCH';
   let confidence = Math.max(0, Math.min(100, Number(parsed?.confidence) || 0));
-
-  // Block unprofitable routes entirely
-  if (verdict === 'BUY' && BLOCKED_ROUTES.some(br => String(route).includes(br))) {
-    console.log(`[llm] BUY blocked — route "${route}" is disabled (Lesson #3: unprofitable)`);
-    verdict = 'WATCH';
-  }
 
   if (verdict === 'BUY' && confidence < llmBuyMinConfidence()) {
     console.log(`[llm] BUY downgraded to WATCH — confidence ${confidence} < threshold ${llmBuyMinConfidence()}`);
@@ -236,31 +227,23 @@ export async function decideCandidateBatch(rows, triggerCandidateId) {
     candidates: [],  // placeholder, filled below
   };
 
-  user.candidates = rows.filter(row => {
-    const route = row.candidate?.signals?.route || '';
-    if (BLOCKED_ROUTES.some(br => route.includes(br))) {
-      console.log(`[llm] filtered blocked route "${route}"`);
-      return false;
-    }
-    return true;
-  }).map(compactCandidateForLlm);
+  user.candidates = rows.map(compactCandidateForLlm);
 
-  // Skip LLM call entirely if all candidates were filtered — saves tokens
+  // Skip LLM call entirely when there is nothing to judge — saves tokens
   if (user.candidates.length === 0) {
-    console.log(`[llm] all ${rows.length} candidates filtered (blocked routes) — 0 tokens used`);
+    console.log('[llm] no candidates — 0 tokens used');
     return {
       verdict: 'WATCH',
       confidence: 0,
       selected_candidate_id: null,
       selected_mint: null,
-      reason: `All ${rows.length} candidates from blocked routes.`,
-      risks: ['all_blocked_routes'],
+      reason: 'No eligible candidates.',
+      risks: ['no_candidates'],
       suggested_tp_percent: numSetting('default_tp_percent', 50),
       suggested_sl_percent: numSetting('default_sl_percent', -25),
       raw: null,
     };
   }
-  console.log(`[llm] ${user.candidates.length}/${rows.length} candidates passed filter`);
 
   try {
     const userPrompt = JSON.stringify(user);

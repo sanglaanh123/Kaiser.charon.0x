@@ -226,6 +226,8 @@ export function initDb() {
 
   const defaults = {
     agent_enabled: 'true',
+    // Profitable routes only (excludes dual_source, fee_graduated_trending, pumpfun_pregrad, graduated_trending). Empty = all.
+    allowed_routes: 'single_source,multi_source,fee_graduated,fee_trending,trending,trenches_completed,pumpportal_graduated,dip_sniper,dip_dip_buy,dip_smart_money,dip_degen',
     trading_mode: process.env.TRADING_MODE || 'dry_run',
     llm_candidate_pick_count: process.env.LLM_CANDIDATE_PICK_COUNT || '10',
     llm_candidate_max_age_ms: process.env.LLM_CANDIDATE_MAX_AGE_MS || String(10 * 60 * 1000),
