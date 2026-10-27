@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { ENABLE_JEV, TYPESAFE_API_KEY, JEV_MODEL, JEV_TIMEOUT_MS } from '../config.js';
-import { numSetting, activeStrategy } from '../db/settings.js';
+import { numSetting, boolSetting, activeStrategy } from '../db/settings.js';
 import { storeSignalEvent } from '../signals/trending.js';
 
 const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
@@ -282,7 +282,11 @@ export async function decideCandidateBatch(rows, triggerCandidateId) {
     perRow: ok.map(r => ({ candidateId: r.row.id, answers: r.answers, usage: r.usage })),
   };
 
-  const eligible = ok.filter(r => r.choice === 'BUY' && r.rug < maxRug);
+  // Default: Jev must pick BUY outright. jev_require_buy_choice=false (testing) accepts any row whose
+  // P(BUY) clears the confidence threshold, even when WATCH is Jev's top choice.
+  const requireChoice = boolSetting('jev_require_buy_choice', true);
+  const minPct = llmBuyMinConfidence();
+  const eligible = ok.filter(r => r.rug < maxRug && (requireChoice ? r.choice === 'BUY' : r.pBuy * 100 >= minPct));
   const best = eligible.sort((a, b) => b.pBuy * (1 - b.rug) - a.pBuy * (1 - a.rug))[0] || null;
 
   // Each screened row keeps its own verdict: a PASS stays PASS (60m cache) instead of becoming WATCH.

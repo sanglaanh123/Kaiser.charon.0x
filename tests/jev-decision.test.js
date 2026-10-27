@@ -147,6 +147,23 @@ test('active strategy llm_min_confidence overrides the global setting', async ()
   }
 });
 
+test('jev_require_buy_choice=false buys on P(BUY) over threshold even when WATCH leads', async () => {
+  axios.post = async () => answer({ choice: 'WATCH', pBuy: 0.45, pWatch: 0.5, pPass: 0.05, rug: 0.1 });
+  try {
+    assert.equal((await decideCandidateBatch([row(1)], 1)).verdict, 'WATCH');
+    setSetting('jev_require_buy_choice', 'false');
+    _resetJevCache();
+    const d = await decideCandidateBatch([row(1)], 1);
+    assert.equal(d.verdict, 'BUY');
+    assert.equal(d.selected_candidate_id, 1);
+    axios.post = async () => answer({ choice: 'WATCH', pBuy: 0.3, pWatch: 0.6, pPass: 0.1, rug: 0.1 });
+    _resetJevCache();
+    assert.equal((await decideCandidateBatch([row(1)], 1)).verdict, 'WATCH');
+  } finally {
+    setSetting('jev_require_buy_choice', 'true');
+  }
+});
+
 test('BUY with high rug is vetoed', async () => {
   axios.post = async () => answer({ choice: 'BUY', pBuy: 0.9, pWatch: 0.05, pPass: 0.05, rug: 0.6 });
   const d = await decideCandidateBatch([row(1)], 1);
