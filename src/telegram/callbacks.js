@@ -23,7 +23,7 @@ import { candidateById, updateCandidateStatus } from '../db/candidates.js';
 import { storeDecision, logDecisionEvent } from '../db/decisions.js';
 import { createDryRunPosition, canOpenMorePositions, openPositionCount, tradingMode } from '../db/positions.js';
 import { executeLiveBuy, executeConfirmedIntent, rejectIntent } from '../execution/router.js';
-import { sendCandidate, sendPosition, closePosition, updatePositionRule, toggleTrailing } from './commands.js';
+import { sendCandidate, sendPosition, sendPositions, sendPnl, closePosition, updatePositionRule, toggleTrailing } from './commands.js';
 import { requestNumericFilterInput, requestStrategyNumericInput } from './input.js';
 
 export async function handleCallback(query) {
@@ -53,10 +53,7 @@ export async function handleCallback(query) {
   if (data === 'menu:strategy') return editMenuMessage(query, strategyMenuText(), strategyKeyboard());
   if (data === 'menu:wallets') return editMenuMessage(query, walletsText(), navKeyboard());
   if (data === 'menu:positions') return editMenuMessage(query, positionsText(), navKeyboard());
-  if (data === 'menu:pnl') {
-    const { sendPnl } = await import('./send.js');
-    return sendPnl(chatId, query);
-  }
+  if (data === 'menu:pnl') return sendPnl(chatId, query);
   if (data === 'menu:settings') return editMenuMessage(query, `${agentText()}\n\n${filtersText()}`, navKeyboard([
     [
       { text: 'Agent', callback_data: 'menu:agent' },
@@ -119,6 +116,8 @@ export async function handleCallback(query) {
     return sendPositionOpen(positionId);
   }
   if (kind === 'tpsl') return sendTpSlDefaults(chatId, query);
+  // Alert cards list positions in a new message instead of overwriting the card.
+  if (kind === 'pos' && id === 'list') return sendPositions(chatId);
   if (kind === 'pos') return sendPosition(chatId, Number(id), query);
   if (kind === 'sell') return closePosition(chatId, Number(id), 'MANUAL');
   if (kind === 'tp') return updatePositionRule(chatId, Number(id), 'tp_percent', Number(value), query);
@@ -142,6 +141,10 @@ export async function editMenuMessage(query, text, extra = {}) {
     });
   }
   try {
+    // Entry/exit cards are photos: their text is a caption, which editMessageText cannot change.
+    if (query.message?.photo) {
+      return await bot.editMessageCaption(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...extra });
+    }
     return await bot.editMessageText(text, {
       chat_id: chatId,
       message_id: messageId,

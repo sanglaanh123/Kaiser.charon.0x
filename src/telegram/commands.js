@@ -1,6 +1,6 @@
 import { bot } from './bot.js';
 import { TELEGRAM_CHAT_ID } from '../config.js';
-import { now, json } from '../utils.js';
+import { now } from '../utils.js';
 import { escapeHtml, fmtPct } from '../format.js';
 import { db } from '../db/connection.js';
 import { setting, numSetting, boolSetting, setSetting, activeStrategy, setActiveStrategy, strategyById, updateStrategyConfig } from '../db/settings.js';
@@ -21,10 +21,9 @@ import {
   strategyMenuText,
   strategyKeyboard,
 } from './menus.js';
-import { sendTelegram, sendBatch, sendPositionOpen } from './send.js';
+import { sendTelegram, sendBatch, sendPositionOpen, sendPositionExit } from './send.js';
 import { candidateSummary, formatPosition } from './format.js';
 import { refreshPosition } from '../execution/positions.js';
-import { executeLiveSell } from '../execution/router.js';
 import { handleCallback, editMenuMessage } from './callbacks.js';
 import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
@@ -187,6 +186,7 @@ export async function sendPosition(chatId, id, query = null) {
       return null;
     });
     if (refreshed) row = { ...row, ...refreshed };
+    if (refreshed?.exitReason) return sendPositionExit(refreshed);
   }
   const buttons = row.status === 'open' ? positionButtons(id) : {};
   if (query) return editMenuMessage(query, formatPosition(row), buttons);
@@ -196,36 +196,13 @@ export async function sendPosition(chatId, id, query = null) {
 export async function closePosition(chatId, id, reason) {
   const row = db.prepare('SELECT * FROM dry_run_positions WHERE id = ?').get(id);
   if (!row || row.status !== 'open') return bot.sendMessage(chatId, 'Open position not found.');
-  const result = await refreshPosition(row, { autoExit: false });
-  const price = result?.price ?? row.high_water_price ?? row.entry_price;
-  const mcap = result?.mcap ?? row.high_water_mcap ?? row.entry_mcap;
-  const pnlPercent = row.entry_mcap ? (Number(mcap) / Number(row.entry_mcap) - 1) * 100 : 0;
-  const pnlSol = Number(row.size_sol) * pnlPercent / 100;
-  let sell = null;
-  if (row.execution_mode === 'live') sell = await executeLiveSell(row, reason);
-  let entrySwap = null;
-  try { entrySwap = JSON.parse(row.snapshot_json || '{}').swap; } catch {}
-  const receivedSol = row.execution_mode === 'live' ? Number(sell?.outputAmount || 0) / 1_000_000_000 : null;
-  const executionFeesSol = row.execution_mode === 'live' ? (
-    Number(entrySwap?.order?.signatureFeeLamports || 0) +
-    Number(entrySwap?.order?.prioritizationFeeLamports || 0) +
-    Number(sell?.order?.signatureFeeLamports || 0) +
-    Number(sell?.order?.prioritizationFeeLamports || 0)
-  ) / 1_000_000_000 : 0;
-  const finalPnlSol = receivedSol > 0 ? receivedSol - Number(row.size_sol) - executionFeesSol : pnlSol;
-  const finalPnlPercent = receivedSol > 0 ? finalPnlSol / Number(row.size_sol) * 100 : pnlPercent;
-  db.prepare(`
-    UPDATE dry_run_positions
-    SET status = 'closed', closed_at_ms = ?, exit_price = ?, exit_mcap = ?, exit_reason = ?,
-        pnl_percent = ?, pnl_sol = ?, exit_signature = ?
-    WHERE id = ?
-  `).run(now(), price, mcap, reason, finalPnlPercent, finalPnlSol, sell?.signature || null, id);
-  db.prepare(`
-    INSERT INTO dry_run_trades (position_id, mint, side, at_ms, price, mcap, size_sol, token_amount_est, reason, payload_json)
-    VALUES (?, ?, 'sell', ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, row.mint, now(), price, mcap, row.size_sol, row.token_amount_est, reason, json({ pnlPercent: finalPnlPercent, pnlSol: finalPnlSol, receivedSol, executionFeesSol, sell }));
-  const label = row.execution_mode === 'live' ? 'Closed live position' : 'Closed dry-run position';
-  await bot.sendMessage(chatId, `${label} #${id}: ${escapeHtml(reason)} ${fmtPct(finalPnlPercent)}`, { parse_mode: 'HTML' });
+  // Same close path as automatic exits (paper fees + partial proceeds, or the live sell).
+  const result = await refreshPosition(row, { autoExit: true, forceExitReason: reason }).catch((err) => {
+    console.log(`[position] manual close ${id} ${err.message}`);
+    return { error: err.message };
+  });
+  if (result?.exitReason) return sendPositionExit(result);
+  return bot.sendMessage(chatId, `Could not close position #${id}${result?.error ? `: ${escapeHtml(result.error)}` : ' (no price or already closing). Try again.'}`, { parse_mode: 'HTML' });
 }
 
 export async function updatePositionRule(chatId, id, field, nextValue, query = null) {
@@ -342,7 +319,7 @@ async function sendStatus(chatId) {
   return bot.sendMessage(chatId, lines.map(escapeHtml).join('\n'), { parse_mode: 'HTML' });
 }
 
-async function sendPnl(chatId, query = null) {
+export async function sendPnl(chatId, query = null) {
   const s = pnlSummary();
   const line = (label, x) => `• <b>${label}</b>: ${x.n} closed · wins ${x.wins} (${fmtPct(x.winRate)}) · PnL ${x.pnlSol.toFixed(4)} SOL · avg ${fmtPct(x.avgPct)}`;
   const text = s.all.n

@@ -148,7 +148,9 @@ function paperNet(entryLamports, outLamports, realizedPartialSol) {
   });
 }
 
-export async function refreshPosition(position, { autoExit = true } = {}) {
+// forceExitReason (e.g. 'MANUAL' from the Dry Sell button) closes through the same paper/live
+// path as automatic exits, so fees, partial proceeds and the double-close guard all apply.
+export async function refreshPosition(position, { autoExit = true, forceExitReason = null } = {}) {
   // Bug2 fix (2026-06-19): bypass 20s cache for live monitoring — flash crash detection requires fresh data
   // Quote-first: dry and live decisions share the same 10s per-mint executable quote snapshot.
   // Wallet-PnL remains telemetry only; it must not alter exit decisions.
@@ -264,7 +266,7 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
   // Trailing stop triggers if price drops from high water mark by effectiveTrailPct,
   // OR if an armed position pulls back to/below the trailing floor (protecting armed profit).
   const trailingHit = trailingArmed && position.trailing_enabled && (trailDrop <= -effectiveTrailPct || pnlPercent <= trailingFloor);
-  let exitReason = null;
+  let exitReason = forceExitReason || null;
   let closed = false;
 
   // Max hold time check — tiered by entry mcap
@@ -280,7 +282,7 @@ export async function refreshPosition(position, { autoExit = true } = {}) {
   //   effectiveMaxHold = 900000; // 15 min for highcap >60K
   //   console.log(`[position] highcap >60K — max_hold reduced to 15min`);
   // }
-  if (effectiveMaxHold > 0 && (now() - position.opened_at_ms) >= effectiveMaxHold) {
+  if (!exitReason && effectiveMaxHold > 0 && (now() - position.opened_at_ms) >= effectiveMaxHold) {
     exitReason = 'MAX_HOLD';
   }
 

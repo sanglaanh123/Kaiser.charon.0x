@@ -2,7 +2,7 @@ import { bot } from './bot.js';
 import { TELEGRAM_CHAT_ID, TELEGRAM_TOPIC_ID, DB_PATH } from '../config.js';
 import { generateDailyCard } from '../visuals/dailyCard.js';
 import { escapeHtml } from '../format.js';
-import { writeFileSync, unlinkSync } from 'fs';
+import { PNG_FILE } from './send.js';
 import { openDatabase } from '../db/sqlite.js';
 
 export async function buildDailyReport() {
@@ -159,19 +159,15 @@ export function buildReportCaption(report) {
 }
 
 export async function sendDailyReport(chatId = TELEGRAM_CHAT_ID) {
-  let tmpPath = '';
   try {
     const report = await buildDailyReport();
     const buffer = await generateDailyCard(report);
-    tmpPath = `/tmp/charon_daily_${new Date().toISOString().slice(0, 10)}.png`;
-    writeFileSync(tmpPath, buffer);
-
-    await bot.sendPhoto(chatId, tmpPath, {
+    await bot.sendPhoto(chatId, buffer, {
       caption: buildReportCaption(report),
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(TELEGRAM_TOPIC_ID ? { message_thread_id: Number(TELEGRAM_TOPIC_ID) } : {}),
-    });
+    }, PNG_FILE);
     console.log('[dailyReport] sent successfully');
   } catch (err) {
     console.error('[dailyReport] failed:', err.message);
@@ -218,9 +214,5 @@ export async function sendDailyReport(chatId = TELEGRAM_CHAT_ID) {
         ...(TELEGRAM_TOPIC_ID ? { message_thread_id: Number(TELEGRAM_TOPIC_ID) } : {}),
       });
     } catch { /* give up */ }
-  } finally {
-    if (tmpPath) {
-      try { unlinkSync(tmpPath); } catch { /* ignore */ }
-    }
   }
 }

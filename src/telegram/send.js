@@ -10,7 +10,9 @@ import { candidateButtons, batchRevealButtons, positionButtons, intentButtons } 
 import { batchById } from '../db/decisions.js';
 import { generateEntryCard } from '../visuals/entryCard.js';
 import { generateExitCard } from '../visuals/exitCard.js';
-import { writeFileSync, unlinkSync } from 'fs';
+
+// Cards go to Telegram straight from memory (no temp file: /tmp does not exist on Windows).
+export const PNG_FILE = { filename: 'card.png', contentType: 'image/png' };
 
 export async function sendTelegram(text, extra = {}) {
   return bot.sendMessage(TELEGRAM_CHAT_ID, text, {
@@ -62,7 +64,7 @@ export async function sendBatch(chatId, batchId) {
     text: `${index + 1}. ${row.candidate.token?.symbol || short(row.candidate.token?.mint || '')}`,
     callback_data: `cand:${row.id}`,
   }]));
-  keyboard.push([{ text: 'Positions', callback_data: 'menu:positions' }]);
+  keyboard.push([{ text: 'Positions', callback_data: 'pos:list' }]);
   return bot.sendMessage(chatId, lines.filter(Boolean).join('\n'), {
     parse_mode: 'HTML',
     disable_web_page_preview: true,
@@ -83,17 +85,14 @@ export async function sendPositionOpen(positionId) {
   let sent;
   try {
     const buffer = await generateEntryCard(position);
-    const tmpPath = `/tmp/charon_entry_${positionId}.png`;
-    writeFileSync(tmpPath, buffer);
-    sent = await bot.sendPhoto(TELEGRAM_CHAT_ID, tmpPath, {
+    sent = await bot.sendPhoto(TELEGRAM_CHAT_ID, buffer, {
       caption: text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(TELEGRAM_TOPIC_ID ? { message_thread_id: Number(TELEGRAM_TOPIC_ID) } : {}),
       ...(positionButtons(positionId)?.reply_markup ? { reply_markup: positionButtons(positionId).reply_markup } : {}),
-    });
+    }, PNG_FILE);
     photoSent = true;
-    try { unlinkSync(tmpPath); } catch (_) {}
   } catch (err) {
     if (!photoSent) {
       console.log('[send] entry card failed:', err.message);
@@ -114,16 +113,13 @@ export async function sendPositionExit(position) {
   let photoSent = false;
   try {
     const buffer = await generateExitCard(position);
-    const tmpPath = `/tmp/charon_exit_${position.id}.png`;
-    writeFileSync(tmpPath, buffer);
-    await bot.sendPhoto(TELEGRAM_CHAT_ID, tmpPath, {
+    await bot.sendPhoto(TELEGRAM_CHAT_ID, buffer, {
       caption: text,
       parse_mode: 'HTML',
       disable_web_page_preview: true,
       ...(TELEGRAM_TOPIC_ID ? { message_thread_id: Number(TELEGRAM_TOPIC_ID) } : {}),
-    });
+    }, PNG_FILE);
     photoSent = true;
-    try { unlinkSync(tmpPath); } catch (_) {}
   } catch (err) {
     if (!photoSent) {
       console.log('[send] exit card failed:', err.message);

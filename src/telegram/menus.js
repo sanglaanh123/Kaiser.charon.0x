@@ -303,7 +303,7 @@ export function candidateButtons(candidateId, decision = null) {
             { text: 'View Candidate', callback_data: `cand:${candidateId}` },
             { text: 'Ignore', callback_data: `ign:${candidateId}` },
           ],
-          [{ text: 'Positions', callback_data: 'menu:positions' }],
+          [{ text: 'Positions', callback_data: 'pos:list' }],
         ],
       },
     };
@@ -315,7 +315,7 @@ export function candidateButtons(candidateId, decision = null) {
           [{ text: 'Jev BUY selected', callback_data: 'noop' }],
           [
             { text: 'View Candidate', callback_data: `cand:${candidateId}` },
-            { text: 'Positions', callback_data: 'menu:positions' },
+            { text: 'Positions', callback_data: 'pos:list' },
           ],
           [
             { text: 'Set TP/SL', callback_data: `tpsl:c:${candidateId}` },
@@ -336,7 +336,7 @@ export function candidateButtons(candidateId, decision = null) {
           { text: 'Set TP/SL', callback_data: `tpsl:c:${candidateId}` },
           { text: 'Ignore', callback_data: `ign:${candidateId}` },
         ],
-        [{ text: 'Positions', callback_data: 'menu:positions' }],
+        [{ text: 'Positions', callback_data: 'pos:list' }],
       ],
     },
   };
@@ -349,7 +349,7 @@ export function batchRevealButtons(batchId, rows, decision, triggerCandidateId =
   if (selectedId) keyboard.push([{ text: 'Reveal Pick', callback_data: `cand:${selectedId}` }]);
   keyboard.push([{ text: 'Reveal Batch', callback_data: `batch:${batchId}` }]);
   if (triggerId && triggerId !== selectedId) keyboard.push([{ text: 'Reveal Trigger', callback_data: `cand:${triggerId}` }]);
-  keyboard.push([{ text: 'Positions', callback_data: 'menu:positions' }]);
+  keyboard.push([{ text: 'Positions', callback_data: 'pos:list' }]);
   return { reply_markup: { inline_keyboard: keyboard } };
 }
 
@@ -383,7 +383,7 @@ export function intentButtons(intentId) {
           { text: 'Confirm Buy', callback_data: `intent:${intentId}:confirm` },
           { text: 'Reject', callback_data: `intent:${intentId}:reject` },
         ],
-        [{ text: 'Positions', callback_data: 'menu:positions' }],
+        [{ text: 'Positions', callback_data: 'pos:list' }],
       ],
     },
   };
