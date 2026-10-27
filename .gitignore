@@ -38,3 +38,6 @@ output/
 # Ad-hoc manual scripts
 test_render.js
 test_simple_ws.js
+
+# CodeGraph index
+.codegraph/

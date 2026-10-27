@@ -3,7 +3,7 @@ import { TELEGRAM_CHAT_ID } from '../config.js';
 import { now, json } from '../utils.js';
 import { escapeHtml, fmtPct } from '../format.js';
 import { db } from '../db/connection.js';
-import { numSetting, boolSetting, setSetting, activeStrategy, setActiveStrategy, strategyById, updateStrategyConfig } from '../db/settings.js';
+import { setting, numSetting, boolSetting, setSetting, activeStrategy, setActiveStrategy, strategyById, updateStrategyConfig } from '../db/settings.js';
 import { candidateById, latestCandidateByMint, updateCandidateStatus } from '../db/candidates.js';
 import { storeDecision, logDecisionEvent } from '../db/decisions.js';
 import {
@@ -29,6 +29,7 @@ import { handleCallback, editMenuMessage } from './callbacks.js';
 import { consumeNumericFilterInput } from './input.js';
 import { runLearning, sendLessons } from '../learning/commands.js';
 import { sendDailyReport } from './dailyReport.js';
+import { jupiterUsageStats } from '../enrichment/jupiter.js';
 
 export async function handleMessage(msg) {
   const text = (msg.text || '').trim();
@@ -76,6 +77,7 @@ export async function handleMessage(msg) {
     return bot.sendMessage(chatId, `Updated ${id}.${key} = ${value}\n\n${strategyMenuText()}`, { parse_mode: 'HTML' });
   }
   if (text.startsWith('/pnl')) return sendPnl(chatId);
+  if (text.startsWith('/status')) return sendStatus(chatId);
   if (text.startsWith('/report')) return sendDailyReport(chatId);
   if (text.startsWith('/learn')) {
     const windowArg = text.split(/\s+/)[1] || '12h';
@@ -256,6 +258,7 @@ export function setupTelegram() {
     { command: 'positions', description: 'Show dry-run positions' },
     { command: 'candidate', description: 'Show candidate by mint' },
     { command: 'filters', description: 'Show filters' },
+    { command: 'status', description: 'Bot mode + Jupiter rate-limit usage' },
     { command: 'pnl', description: 'Show saved-wallet PnL' },
     { command: 'learn', description: 'Run manual learning report' },
     { command: 'lessons', description: 'Show active screening lessons' },
@@ -302,17 +305,30 @@ export function pnlSummary() {
   };
 }
 
+function jupiterStatusLine() {
+  const u = jupiterUsageStats();
+  const limit = Number(process.env.JUP_MAIN_RPM) || 60;
+  const datapi = u.datapi.backoffActive ? 'backoff ON' : 'backoff off';
+  return `Jupiter: main ${u.main.requestsLast60s}/${limit} req/60s, 429s ${u.main.count429 + u.datapi.count429}, datapi ${datapi}, queued main ${u.main.queued} / datapi ${u.datapi.queued}`;
+}
+
+async function sendStatus(chatId) {
+  const mode = setting('trading_mode', 'dry_run');
+  const open = db.prepare("SELECT COUNT(*) AS n FROM dry_run_positions WHERE status = 'open'").get().n;
+  const lines = [`Mode: ${mode}`, `Open positions: ${open}`, jupiterStatusLine()];
+  return bot.sendMessage(chatId, lines.map(escapeHtml).join('\n'), { parse_mode: 'HTML' });
+}
+
 async function sendPnl(chatId, query = null) {
   const s = pnlSummary();
   const line = (label, x) => `• <b>${label}</b>: ${x.n} closed · wins ${x.wins} (${fmtPct(x.winRate)}) · PnL ${x.pnlSol.toFixed(4)} SOL · avg ${fmtPct(x.avgPct)}`;
   const text = s.all.n
     ? `📊 <b>PnL</b>
 
-${[line('All', s.all), line('Live', s.live), line('Paper', s.paper)].join('
-')}`
-    : '📊 <b>PnL</b>
+${[line('All', s.all), line('Live', s.live), line('Paper', s.paper)].join('\n')}`
+    : `📊 <b>PnL</b>
 
-No closed positions yet.';
+No closed positions yet.`;
   return query ? editMenuMessage(query, text, navKeyboard()) : bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
 }
 

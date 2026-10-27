@@ -70,8 +70,17 @@ export const JSON_HEADERS = {
 export function validateConfig() {
   if (!TELEGRAM_BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN is required.');
   if (!TELEGRAM_CHAT_ID) throw new Error('TELEGRAM_CHAT_ID is required.');
-  if (!HELIUS_API_KEY && (!process.env.SOLANA_RPC_URL || !process.env.SOLANA_WS_URL)) {
-    throw new Error('HELIUS_API_KEY is required unless SOLANA_RPC_URL and SOLANA_WS_URL are set.');
-  }
+  if (!JUPITER_API_KEY) throw new Error('JUPITER_API_KEY is required (Jupiter free tier needs a key; get one at portal.jup.ag).');
   if (GMGN_ENABLED && !GMGN_API_KEY) throw new Error('GMGN_API_KEY is required unless GMGN_ENABLED=false.');
+  if (ENABLE_JEV && !TYPESAFE_API_KEY) throw new Error('TYPESAFE_API_KEY is required unless ENABLE_JEV=false.');
+
+  // Wallet + RPC only matter when real transactions can happen. trading_mode can also be switched
+  // from Telegram at runtime; requireLiveExecution() fails with a clear error at live-use time.
+  const mode = String(process.env.TRADING_MODE || 'dry_run').toLowerCase();
+  if (mode === 'live' || mode === 'confirm') {
+    if (!SOLANA_PRIVATE_KEY) throw new Error(`SOLANA_PRIVATE_KEY (or PRIVATE_KEY) is required when TRADING_MODE=${mode}.`);
+    if (!HELIUS_API_KEY && !process.env.SOLANA_RPC_URL) {
+      throw new Error(`HELIUS_API_KEY or SOLANA_RPC_URL is required when TRADING_MODE=${mode}.`);
+    }
+  }
 }

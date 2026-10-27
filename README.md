@@ -5,7 +5,7 @@
 ![mode](https://img.shields.io/badge/execution-dry__run-c9a227?style=flat-square)
 ![license](https://img.shields.io/badge/license-none%20%C2%B7%20personal%20project-555?style=flat-square)
 
-A Telegram bot that screens Solana pump.fun tokens, filters them through a strategy, optionally asks an LLM to pick entries, and executes through Jupiter. Three modes: `dry_run` (paper fills into SQLite), `confirm` (Telegram approve/reject), and `live` (real swaps).
+A Telegram bot that screens Solana pump.fun tokens, filters them through a strategy, asks Jev (TypeSafe System One, a classifier) to score entries, and executes through Jupiter. Three modes: `dry_run` (paper fills into SQLite), `confirm` (Telegram approve/reject), and `live` (real swaps).
 
 A working fork of [yunus-0x/charon](https://github.com/yunus-0x/charon). All credit for the original idea and codebase goes to him — I kept changing things while running it, and at some point the diff got big enough that it needed its own home.
 
@@ -21,9 +21,10 @@ A working fork of [yunus-0x/charon](https://github.com/yunus-0x/charon). All cre
 | **Active route** | `pumpfun_pregrad` only (allowlist, gated before enrichment) |
 | **Exit rules** | SL −20% · arm trailing at +10% · trail 8% · TP +50% · max hold 30m |
 | **Sizing** | 0.1 SOL/trade · 5 concurrent positions · liquidity floor $15k |
-| **LLM** | off (`use_llm=false`) — decisions are rule-based |
+| **Decision** | Jev classifier (verdict / rug / momentum); `llm_min_confidence` = P(BUY)×100, recalibrate in `dry_run` |
+| **Jupiter budget** | free tier: 1 RPS main bucket, priority queue (exits first); `max_open_positions` ≤ 3 fits |
 | **Storage** | SQLite in WAL mode; hot-read strategy params, env only on restart |
-| **Tests** | 29 offline tests (`npm test`), no network or keys needed |
+| **Tests** | offline tests (`npm test`), no network or keys needed |
 
 ## What this fork changes
 
@@ -44,7 +45,7 @@ cd Kaiser.charon
 npm install                 # native build — see Requirements
 cp .env.example .env        # fill in tokens + RPC below
 npm run check               # syntax check before first boot
-npm test                    # 29 offline tests
+npm test                    # offline tests
 npm start
 ```
 
@@ -55,9 +56,13 @@ TELEGRAM_BOT_TOKEN=123456:ABC-DEF...   # @BotFather
 TELEGRAM_CHAT_ID=your_chat_id
 SIGNAL_SERVER_URL=https://api.thecharon.xyz/api
 SIGNAL_SERVER_KEY=your_signal_key
-HELIUS_API_KEY=your_helius_key
+JUPITER_API_KEY=your_jupiter_key       # required, free tier works
+GMGN_API_KEY=your_gmgn_key             # or GMGN_ENABLED=false
+TYPESAFE_API_KEY=your_typesafe_key     # or ENABLE_JEV=false
 TRADING_MODE=dry_run
 ```
+
+No RPC or wallet is needed for `dry_run`. `HELIUS_API_KEY` / `SOLANA_RPC_URL` and `SOLANA_PRIVATE_KEY` are only required for `confirm` / `live`. Adding `HELIUS_API_KEY` (or `SOLANA_WS_URL`) also turns on the on-chain fee-claim listener. Startup fails with an error naming the missing variable.
 
 The SQLite database is created at `DB_PATH` on first run. Nothing else to provision.
 
@@ -74,14 +79,15 @@ Live values on the running instance:
 |---|---|---|
 | `allowed_routes` | `pumpfun_pregrad` | only route with measured positive expectancy (see Notes) |
 | `min_liquidity_usd` | `15000` | below this the sell quote is the market |
-| `max_open_positions` | `5` | each position costs ~2 quote calls/tick |
+| `max_open_positions` | `5` | each position costs ~2 quote calls/tick; ≤ 3 is what fits the 1 RPS free Jupiter budget |
 | `trailing_arm_percent` | `10` | arm later, give runners room |
 | `trailing_floor_percent` | `8` | floor after arming |
 | `tp_percent` / `sl_percent` | `50` / `-20` | wider target, tighter stop |
 | `max_hold_ms` | `1800000` | 30 min — pregrad runners die fast |
-| `use_llm` | `false` | rule-based path for the single route |
+| `use_llm` | `false` | rule-based path for the single route; set `true` to route decisions through Jev |
+| `jev_max_rug` | setting | Jev rug-score ceiling for BUY |
 
-Optional subsystems are off until their flag is set: `GMGN_ENABLED`, `PUMPPORTAL_ENABLED` (needs `PUMPPORTAL_API_KEY`), `PREGRAD_ENABLED`, `ENABLE_LLM` (needs `LLM_API_KEY`), `TRENDING_ENABLED=false` (disables GMGN trending **and** trending candidates arriving from the signal server).
+Optional subsystems are off until their flag is set: `GMGN_ENABLED`, `PUMPPORTAL_ENABLED` (needs `PUMPPORTAL_API_KEY`), `PREGRAD_ENABLED`, `ENABLE_JEV` (needs `TYPESAFE_API_KEY`), `FEE_CLAIM_WS_ENABLED` (needs `SOLANA_WS_URL` or `HELIUS_API_KEY`), `TRENDING_ENABLED=false` (disables GMGN trending **and** trending candidates arriving from the signal server).
 
 ## How it runs
 
@@ -89,15 +95,22 @@ Optional subsystems are off until their flag is set: `GMGN_ENABLED`, `PUMPPORTAL
 SIGNAL SOURCES                              INGRESS GATE
 ├── Signal Server (api.thecharon.xyz)  ─┐
 ├── PumpPortal WebSocket              ─┤
-├── GMGN Trending / Trenches          ─┼──→ routeAllowed()
-├── pump.fun pregrad (CF sidecar)     ─┤    before enrichment,
-└── Fee claims / smart money          ─┘    costs zero API calls
+├── GMGN Trenches                     ─┤
+├── Jupiter trending (GMGN fallback)  ─┼──→ routeAllowed()
+├── pump.fun graduated / pregrad      ─┤    allowed_routes only,
+│   (REST + CF sidecar)               ─┤    before enrichment,
+└── Fee claims: signal server         ─┘    costs zero API calls
+    + on-chain WS listener
 
 PIPELINE
-  signal → buildCandidate() → enrichment (GMGN, Jupiter, Twitter)
+  signal → cheapPrefilter() → buildCandidate()
+  → enrichment: fetchTokenMarket (Jupiter → GMGN fallback)
+    through one rate-limited Jupiter client (1 RPS free tier,
+    priority queue: exits first, then entries, then enrichment)
   → filterCandidate() → preScore() → momentumFilter()
-  → decision (LLM batch, or rule-based when use_llm=false)
+  → decision: Jev classifier (verdict / rug / momentum), cached in decision_cache
   → dry-run position | Telegram confirm | live swap
+    (Jupiter /swap/v2/order + /execute, signed locally)
 
 EXECUTION LOOP (10s)
   monitorPositions() → Jupiter sell quote (fill-to-fill)
@@ -108,6 +121,18 @@ EXECUTION LOOP (10s)
 Position monitoring is quote-first: exits price on an executable sell quote. If quoting fails, the position is valued at a labelled mark fallback rather than skipped — every exit rule still evaluates. See the fix log for why that distinction matters.
 
 ## Fix log
+
+### 2026-10-27 — refactor: one Jupiter client, Jev, live money-path fixes
+
+| Area | Symptom | Fix |
+|---|---|---|
+| Jupiter client | many callers each rate-limited (or not) on their own | single client with `main` / `execute` / `datapi` buckets and a priority queue (exits first); `/status` shows usage and 429 count |
+| Market data | Jupiter-only; a 429 meant no data | `fetchTokenMarket` falls back to GMGN; cheap prefilter before any network call; decisions cached in `decision_cache` |
+| Live entry | a filled swap could be orphaned, `FAILED_ENTRY` rows overwritten | entry gate + entry lock, `recordFailedEntry`, never orphan a filled swap |
+| Partial TP | realized PnL of the partial leg was lost | recorded in `realized_partial_sol` |
+| Signal sources | dead sources still wired | removed; `allowed_routes` is the only route gate; fee-claim WS listener wired (`FEE_CLAIM_WS_ENABLED`); trending polls at >= 60s with GMGN fallback |
+| Decision | LLM provider chain | replaced by Jev; `llm_min_confidence` is now P(BUY)×100 |
+| `/pnl` | built from saved-wallet queries | computed from the DB |
 
 ### 2026-10-23 — the bleed was plumbing
 
@@ -162,8 +187,10 @@ It binds `127.0.0.1:8799`, serves `GET /fetch?url=<target>` with a host allowlis
 - Native build tools: `build-essential python3 pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev`
 - A **Telegram bot token** and chat ID
 - A **signal server key** — see the [original repo](https://github.com/yunus-0x/charon) for access
-- A **Helius RPC endpoint** (free tier is fine for `dry_run`)
-- For `live` only: a **Solana wallet private key** and a **Jupiter API key**
+- A **Jupiter API key** (free tier works), a **GMGN API key**, and a **TypeSafe API key** for Jev
+- For `confirm` / `live` only: a **Solana wallet private key** (dedicated trading wallet) and an RPC (**Helius** key or `SOLANA_RPC_URL`)
+- Optional: `SOLANA_WS_URL` / Helius key for the on-chain fee-claim listener
+- Jupiter free tier is 1 RPS, which fits `max_open_positions` ≤ 3. On Jupiter Developer ($25/mo, 10 RPS) set `JUP_MAIN_RPS=10` and `JUP_MAIN_RPM=600`.
 
 ## Operations
 
@@ -177,6 +204,16 @@ sqlite3 charon.sqlite "SELECT exit_reason, COUNT(*), ROUND(AVG(pnl_percent),2)
 ```
 
 Start with `TRADING_MODE=dry_run`, watch it for a week. Dry run uses executable quotes on both sides now, but it is still an estimate: API failures trigger fallbacks, and live swaps add wallet state, priority fees, confirmation latency and worse slippage than the quote you saw.
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| Jupiter 429s / stale quotes | `/status` shows main req/60s, 429 count, datapi backoff and queue depth. Lower `max_open_positions`, or on a paid plan raise `JUP_MAIN_RPS` / `JUP_MAIN_RPM` |
+| Jev never called | `ENABLE_JEV` not `false`? `TYPESAFE_API_KEY` set? `use_llm` on for the strategy? |
+| Fee-claim WS off (`[fee] WS listener off`) | set `SOLANA_WS_URL` or `HELIUS_API_KEY` (and not `FEE_CLAIM_WS_ENABLED=false`) |
+| Startup error `X is required` | the message names the missing variable; RPC and wallet are only needed for `confirm` / `live` |
+| pump.fun `403 Just a moment` | run the CF sidecar (see above) |
 
 ## Notes
 

@@ -7,21 +7,25 @@
 SIGNAL SOURCES (pilih salah satu/semua):
 ├── Signal Server (api.thecharon.xyz) — HTTP polling, token fresh
 ├── PumpPortal WebSocket — real-time graduated + pre-grad token
-├── GMGN Trending — trending 5m/1h/6h/24h
+├── Jupiter Trending — poll >= 60s, fallback ke GMGN trending
 ├── GMGN Trenches — bonding curve tokens
-├── Pump.fun Pregrad — scanner pre-graduation
-├── Fee Claims — token yg barusan claim fee
-└── GMGN Signals + Smart Money
+├── Pump.fun graduated + pregrad — REST (+ CF sidecar kalo kena Cloudflare)
+└── Fee Claims — dari signal server + listener on-chain (WS)
+
+INGRESS GATE: allowed_routes (satu-satunya gate route, sebelum enrichment)
 
 PIPELINE (setiap token):
-  Signal → buildCandidate() → enrichment (GMGN/Jupiter/Twitter)
+  Signal → cheapPrefilter() → buildCandidate()
+  → enrichment: fetchTokenMarket (Jupiter → fallback GMGN)
+    lewat 1 client Jupiter ber-rate-limit (free tier 1 RPS, priority queue: exit dulu)
   → filterCandidate() → preScoreCandidate() → momentumFilter()
-  → LLM batch decision → WATCH/PASS/BUY
+  → Jev (classifier TypeSafe: verdict/rug/momentum) → WATCH/PASS/BUY
   → createDryRunPosition() / createLivePosition()
 
 EXECUTION (looping):
   monitorPositions() → quote exit / mark exit / TP / SL / trailing
   → close position → log ke DB → send exit card Telegram
+  Live: Jupiter /swap/v2/order + /execute, tx di-sign lokal
 ```
 
 ## Prasyarat
@@ -59,21 +63,25 @@ TELEGRAM_CHAT_ID=<your_chat_id>
 SIGNAL_SERVER_URL=https://api.thecharon.xyz/api
 SIGNAL_SERVER_KEY=your_signal_key_here
 
-HELIUS_API_KEY=your_helius_key
-# atau:
-# SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=KEY
-# SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=KEY
+JUPITER_API_KEY=your_jupiter_key      # wajib (free tier pun butuh key)
+GMGN_API_KEY=your_gmgn_key            # atau GMGN_ENABLED=false
 
-# Dry run default — ga butuh wallet
+# Dry run default — ga butuh wallet, ga butuh RPC
 TRADING_MODE=dry_run
 MAX_OPEN_POSITIONS=3
 
-# LLM — endpoint OpenAI-compatible
-ENABLE_LLM=true
-LLM_BASE_URL=https://api.minimax.io/v1
-LLM_API_KEY=your_llm_key
-LLM_MODEL=MiniMax-M2.7
+# Jev (TypeSafe System One) — pengganti LLM
+ENABLE_JEV=true
+TYPESAFE_API_KEY=your_typesafe_key
+
+# Opsional: nyalain listener fee-claim on-chain
+# HELIUS_API_KEY=your_helius_key
+# atau SOLANA_WS_URL=wss://mainnet.helius-rpc.com/?api-key=KEY
 ```
+
+RPC (`HELIUS_API_KEY` / `SOLANA_RPC_URL`) + `SOLANA_PRIVATE_KEY` cuma wajib kalo `TRADING_MODE=live` atau `confirm`. Kalo ada yg kurang, bot langsung error dan nyebut nama var-nya.
+
+Budget Jupiter free tier = 1 RPS, jadi `max_open_positions` ≤ 3 aman. Upgrade ke Jupiter Developer ($25/bln, 10 RPS) → set `JUP_MAIN_RPS=10` dan `JUP_MAIN_RPM=600`.
 
 ## Konfigurasi
 **Dua tempat setting:**
@@ -85,7 +93,8 @@ Strategy parameters yang sering di-tune:
 - `tp_percent` / `sl_percent` — take profit / stop loss
 - `trailing_enabled` / `trailing_percent` — trailing stop
 - `max_open_positions` — max concurrent positions
-- `llm_min_confidence` — threshold confidence LLM untuk BUY
+- `llm_min_confidence` — threshold BUY dari Jev = P(BUY)×100 (bukan skor self-rated LLM; kalibrasi ulang di dry_run)
+- `jev_max_rug` — batas rug score Jev buat BUY
 - `momentum_threshold` — threshold ML momentum filter (0.0-1.0)
 - `min_mcap_usd` / `max_mcap_usd` — market cap bounds
 
@@ -109,25 +118,25 @@ Semua sumber sinyal dikonversi ke objek `signals` seragam:
 Satu token bisa masuk dari multiple source → dedup via `seenSignalCandidates` + DB check.
 
 ### 2. buildCandidate()
-Enrichment paralel: GMGN (holder count, total fees, dev info) + Jupiter (price, mcap, holders, chart) + Twitter narrative + saved wallets.
+Enrichment pake `fetchTokenMarket`: Jupiter dulu, fallback GMGN (`JUP_FORCE_FALLBACK=1` buat maksa GMGN) + GMGN (holder count, total fees, dev info) + saved wallets. Semua call Jupiter lewat 1 client ber-rate-limit (bucket main 1 RPS / 60 RPM, execute tanpa throttle, datapi 2 RPS) dengan priority queue: exit > entry > enrichment. `cheapPrefilter()` buang token jelek sebelum nyentuh network.
 
 ### 3. filterCandidate()
-Gate wajib sebelum LLM. Cek: mcap, holders, fee claim, max holder %, ATH distance, rug ratio, bundler rate. Parameter diatur per-strategi. Candidate yg gagal → status `filtered` + alasan.
+Gate wajib sebelum Jev. Cek: mcap, holders, fee claim, max holder %, ATH distance, rug ratio, bundler rate. Parameter diatur per-strategi. Candidate yg gagal → status `filtered` + alasan.
 
 ### 4. preScoreCandidate() + momentumFilter()
 Pre-scoring 0-100 (mcap growth, volume, holder growth, age). ML momentum model `predict_momentum.py` — opsional, skip kalo model ga ada.
 
-### 5. LLM Batch Decision
-Ngumpulin candidate sampe `llm_candidate_pick_count` atau `llm_candidate_max_age_ms` → batch call LLM. Return: BUY/WATCH/PASS + confidence + reason + suggested TP/SL.
+### 5. Jev Decision
+Ngumpulin candidate sampe `llm_candidate_pick_count` atau `llm_candidate_max_age_ms` → Jev (TypeSafe System One, classifier — bukan LLM generatif). Return: verdict BUY/WATCH/PASS, rug, momentum. `llm_min_confidence` = P(BUY)×100. Rug > `jev_max_rug` → ga BUY. Aktif kalo `ENABLE_JEV=true` + `TYPESAFE_API_KEY`.
 
-Cache: BUY decisions gak diproses ulang dalam 10 menit, WATCH/PASS dalam 60 menit. Invalidasi kalo mcap berubah >20% atau holders >30%.
+Cache (tabel `decision_cache`): BUY decisions gak diproses ulang dalam 10 menit, WATCH/PASS dalam 60 menit. Invalidasi kalo mcap berubah >20% atau holders >30%.
 
 Route gate: setting `allowed_routes` (comma-separated, empty = all) is the single source of truth. Default excludes `dual_source`, `fee_graduated_trending`, `pumpfun_pregrad`, `graduated_trending` (Lesson #3 — consistently unprofitable).
 
 ### 6. Position Creation
 - **Dry run**: `dry_run_positions` table, simulate buy + track HWM
 - **Confirm**: Kirim approve/reject button ke Telegram
-- **Live**: Execute swap via Jupiter `/swap/v2/order`, broadcast tx
+- **Live**: Execute swap via Jupiter `/swap/v2/order` + `/execute`, tx di-sign lokal. Ada entry gate + entry lock, swap yg udah filled ga pernah di-orphan (`recordFailedEntry`), partial TP dicatat di `realized_partial_sol`
 
 ### 7. Position Monitoring
 Loop `POSITION_CHECK_MS` (default 10s):
@@ -178,7 +187,7 @@ sudo journalctl -u charon -f
 - `/positions` — list all open positions
 - `/daily` — daily PnL report
 - `/settings` — view/edit semua parameter strategi
-- `/status` — bot stats (uptime, candidates, LLM usage)
+- `/status` — mode, open positions, pemakaian Jupiter (req/60s vs limit, 429, datapi backoff, queue)
 - `/pause` / `/resume` — pause/resume trading
 
 ## Directories
@@ -187,10 +196,10 @@ charon/
 ├── src/
 │   ├── app.js           # Main orchestration
 │   ├── config.js         # Env + constants
-│   ├── pipeline/         # Enrich → filter → LLM → position
+│   ├── pipeline/         # Enrich → filter → Jev → position
 │   ├── execution/        # Position monitor + Jupiter router
 │   ├── signals/          # Semua signal sources
-│   ├── enrichment/       # GMGN, Jupiter, Twitter, wallets
+│   ├── enrichment/       # Jupiter client, market (Jupiter→GMGN), GMGN, wallets
 │   ├── db/               # SQLite connection, queries
 │   ├── telegram/         # Bot commands, send, format, cards
 │   ├── visuals/          # Canvas card rendering
@@ -207,9 +216,11 @@ charon/
 | Masalah | Cek |
 |---|---|
 | `better-sqlite3` / `canvas` gagal build | Install native deps (lihat Prasyarat) |
-| `TELEGRAM_BOT_TOKEN is required` | `.env` ada? `TELEGRAM_BOT_TOKEN` terisi? |
+| `X is required` pas start | Pesan error nyebut var yg kurang (`TELEGRAM_BOT_TOKEN`, `JUPITER_API_KEY`, `GMGN_API_KEY`, `TYPESAFE_API_KEY`; live/confirm: `SOLANA_PRIVATE_KEY` + RPC) |
 | Bot start tapi ga ada sinyal | `SIGNAL_SERVER_KEY` valid? Cek log `[bot]` |
-| LLM ga manggil | `ENABLE_LLM=true`? `LLM_API_KEY` ada? |
+| Jev ga manggil | `ENABLE_JEV` bukan `false`? `TYPESAFE_API_KEY` ada? |
+| Jupiter 429 | Cek `/status`. Kurangin `max_open_positions`, atau kalo udah paid plan naikin `JUP_MAIN_RPS` / `JUP_MAIN_RPM` |
+| Fee claim WS off (`[fee] WS listener off`) | Set `SOLANA_WS_URL` atau `HELIUS_API_KEY` |
 | GMGN error | Rate limit — jangan turunin `GMGN_REQUEST_DELAY_MS` di bawah 2500 |
 | Dry run jalan tapi PnL jelek | It works as designed — paper fills ga kena slippage. Live bakal 20-50% worse |
 | `quote-first` exit error 429 | Jupiter rate limit — fallback ke mark price |
