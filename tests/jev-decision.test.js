@@ -15,9 +15,10 @@ const { default: axios } = await import('axios');
 const { initDb } = await import('../src/db/connection.js');
 initDb();
 const { setSetting } = await import('../src/db/settings.js');
-const { decideCandidateBatch, buildJevState, jevQuestions } = await import('../src/pipeline/jev.js');
+const { decideCandidateBatch, buildJevState, jevQuestions, _resetJevCache } = await import('../src/pipeline/jev.js');
 
 setSetting('llm_min_confidence', '40');
+test.beforeEach(() => _resetJevCache());
 
 function row(id, extra = {}) {
   return {
@@ -57,7 +58,8 @@ function answer({ choice, pBuy, pWatch, pPass, rug }) {
 const SHAPE = ['verdict', 'confidence', 'reason', 'risks', 'suggested_tp_percent', 'suggested_sl_percent', 'raw', 'selected_candidate_id', 'selected_mint', 'selected_row'];
 
 test('BUY with low rug is selected with full return shape', async () => {
-  const rows = [row(1), row(2)];
+  // Distinct states: identical states share one cached Jev answer.
+  const rows = [row(1), row(2, { metrics: { marketCapUsd: 120_000, liquidityUsd: 30_000, holderCount: 900 } })];
   axios.post = async (_url, body) => {
     // identify row by order of calls via state text is unnecessary; alternate by mcap marker
     return body.state.includes('Route') && calls++ === 0
@@ -73,6 +75,23 @@ test('BUY with low rug is selected with full return shape', async () => {
   assert.equal(d.selected_row, rows[1]);
   assert.match(d.reason, /P\(BUY\)=\.72/);
   assert.equal(d.raw.perRow.length, 2);
+});
+
+test('unchanged state is asked once across batches and concurrent calls', async () => {
+  let calls = 0;
+  axios.post = async () => { calls++; return answer({ choice: 'WATCH', pBuy: 0.3, pWatch: 0.6, pPass: 0.1, rug: 0.1 }); };
+  const rows = [row(1), row(2, { metrics: { marketCapUsd: 120_000, liquidityUsd: 30_000, holderCount: 900 } })];
+  await Promise.all([decideCandidateBatch(rows, 1), decideCandidateBatch(rows, 2)]);
+  await decideCandidateBatch(rows, 1);
+  assert.equal(calls, 2);
+});
+
+test('failed Jev call is not cached', async () => {
+  let calls = 0;
+  axios.post = async () => { calls++; throw Object.assign(new Error('boom'), { response: { status: 400 } }); };
+  await decideCandidateBatch([row(1)], 1);
+  await decideCandidateBatch([row(1)], 1);
+  assert.equal(calls, 2);
 });
 
 test('BUY with high rug is vetoed', async () => {

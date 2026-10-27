@@ -6,6 +6,10 @@ import { storeSignalEvent } from '../signals/trending.js';
 const JEV_URL = 'https://api.typesafe.ai/v1/systemone';
 const JEV_CONCURRENCY = 3;
 const JEV_RETRY_DELAY_MS = 250;
+// Every batch re-screens the recent rows; an unchanged bucketed state gets the same
+// answer, so reuse it (and share in-flight calls) instead of spending another request.
+const JEV_ANSWER_TTL_MS = 10 * 60_000;
+const jevAnswers = new Map(); // state -> { at, promise }
 
 // Bucket thresholds (Jev is weak at raw numbers, so state carries words)
 const MCAP_BUCKETS = [[10_000, 'micro'], [50_000, 'small'], [150_000, 'mid'], [Infinity, 'large']];
@@ -149,6 +153,21 @@ export async function jevAsk({ state, questions, timeoutMs = JEV_TIMEOUT_MS }) {
   }
 }
 
+function cachedJevAsk(state, questions) {
+  const at = Date.now();
+  const hit = jevAnswers.get(state);
+  if (hit && at - hit.at < JEV_ANSWER_TTL_MS) return hit.promise;
+  if (jevAnswers.size > 500) {
+    for (const [key, v] of jevAnswers) if (at - v.at >= JEV_ANSWER_TTL_MS) jevAnswers.delete(key);
+  }
+  const promise = jevAsk({ state, questions });
+  jevAnswers.set(state, { at, promise });
+  promise.catch(() => jevAnswers.delete(state));
+  return promise;
+}
+
+export function _resetJevCache() { jevAnswers.clear(); }
+
 function llmBuyMinConfidence() { return numSetting('llm_min_confidence', 40); }
 function llmLowConfidenceCap() { return numSetting('llm_low_confidence_cap', 70); }
 
@@ -232,7 +251,7 @@ export async function decideCandidateBatch(rows, triggerCandidateId) {
   const results = await mapLimit(rows, JEV_CONCURRENCY, async row => {
     try {
       const state = buildJevState(row.candidate, row.candidate?.preScore);
-      const res = await jevAsk({ state, questions });
+      const res = await cachedJevAsk(state, questions);
       const a = res?.answers || {};
       const probs = a.verdict?.probabilities || {};
       const mIdx = Math.max(0, Math.min(3, Math.round(Number(a.momentum?.score) || 0)));

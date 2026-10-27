@@ -154,6 +154,10 @@ export async function processCandidateFromSignals(signals) {
   // Pre-score: rule-based check before LLM (saves LLM credits)
   const preScore = preScoreCandidate(candidate);
   if (!preScore.passed) {
+    candidate.filters.passed = false;
+    candidate.filters.failures.push(`prescore: ${preScore.score} < ${preScore.threshold}`);
+    candidate.preScore = { score: preScore.score, threshold: preScore.threshold };
+    updateCandidateSnapshot(candidateId, candidate, 'filtered');
     console.log(`[prescore] filtered ${candidate.token.mint.slice(0, 8)}... score ${preScore.score}/${preScore.threshold} (${preScore.reasons.slice(0, 2).join('; ')})`);
     return;
   }
@@ -163,6 +167,7 @@ export async function processCandidateFromSignals(signals) {
   // This catches cases where market conditions changed between initial filter and LLM batch eval
   filterCandidate(candidate);
   if (!candidate.filters.passed) {
+    updateCandidateSnapshot(candidateId, candidate, 'filtered');
     console.log(`[pre-llm-guard] filtered ${candidate.token.mint.slice(0, 8)}... ${candidate.filters.failures.join('; ')}`);
     return;
   }
