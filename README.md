@@ -1,4 +1,4 @@
-# Kaiser.Charon
+# Kaiser.Charon.0x
 
 ![node](https://img.shields.io/badge/node-22-339933?style=flat-square&logo=node.js&logoColor=white)
 ![chain](https://img.shields.io/badge/network-solana-9945ff?style=flat-square)
