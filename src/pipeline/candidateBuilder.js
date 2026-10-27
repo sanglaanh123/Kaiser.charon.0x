@@ -6,7 +6,6 @@ import { fetchJupiterChartContext } from '../enrichment/jupiter.js';
 import { fetchTokenMarket, fetchHolders } from '../enrichment/market.js';
 import { fetchSavedWalletExposure } from '../enrichment/wallets.js';
 import { gmgnLink } from '../format.js';
-import { effectivePositionSizeSol } from './jev.js';
 import { openPositionCount } from '../db/positions.js';
 
 export function buildFeeSnapshot(fee, signature) {

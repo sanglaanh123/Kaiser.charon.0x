@@ -8,7 +8,7 @@ import { storeDecision, storeBatchDecision, logDecisionEvent, checkDecisionCache
 import { buildCandidate, filterCandidate, signalLabel, signalMarketSnapshot } from './candidateBuilder.js';
 import { preScoreCandidate } from './preScorer.js';
 import { momentumFilter } from './momentumFilter.js';
-import { decideCandidateBatch } from './jev.js';
+import { decideCandidateBatch, llmBuyMinConfidence } from './jev.js';
 import { activeStrategy } from '../db/settings.js';
 import { createDryRunPosition, createLivePosition, canOpenMorePositions, openPositionCount, tradingMode } from '../db/positions.js';
 import { sendBatchReveal, sendTelegram, sendPositionOpen, sendTradeIntent } from '../telegram/send.js';
@@ -214,14 +214,17 @@ export async function processCandidateFromSignals(signals) {
   }
   const selectedRow = batchDecision.selected_row;
   const selectedThisCandidate = selectedRow?.id === candidateId;
+  // A trigger that was not bought keeps its own Jev verdict (PASS stays PASS) and its own reason.
+  const own = batchDecision.row_verdicts?.[candidateId] || { verdict: 'WATCH', confidence: batchDecision.confidence, reason: batchDecision.reason };
   const currentDecision = selectedThisCandidate
     ? batchDecision
     : {
         ...batchDecision,
-        verdict: 'WATCH',
+        verdict: own.verdict === 'BUY' ? 'WATCH' : own.verdict,
+        confidence: own.confidence,
         reason: selectedRow
-          ? `Batch #${batchId} screened ${rows.length}; selected ${short(selectedRow.candidate.token.mint)} instead. ${batchDecision.reason || ''}`.trim()
-          : `Batch #${batchId} screened ${rows.length}; no buy selected. ${batchDecision.reason || ''}`.trim(),
+          ? `Batch #${batchId} screened ${rows.length}; selected ${short(selectedRow.candidate.token.mint)} instead. ${own.reason || ''}`.trim()
+          : `Batch #${batchId} screened ${rows.length}; no buy selected. ${own.reason || ''}`.trim(),
       };
   const currentDecisionId = storeDecision(candidateId, candidate, currentDecision);
   currentDecision.id = currentDecisionId;
@@ -238,7 +241,7 @@ export async function processCandidateFromSignals(signals) {
   if (batchId) await sendBatchReveal(batchId, rows, batchDecision, candidateId);
 
   // #6: Buy the LLM's selected candidate regardless of which candidate triggered the batch
-  if (selectedRow && boolSetting('agent_enabled', true) && batchDecision.verdict === 'BUY' && batchDecision.confidence >= numSetting('llm_min_confidence')) {
+  if (selectedRow && boolSetting('agent_enabled', true) && batchDecision.verdict === 'BUY' && batchDecision.confidence >= llmBuyMinConfidence()) {
     if (!canOpenMorePositions()) {
       const max = numSetting('max_open_positions', 3);
       console.log(`[agent] max open positions reached (${openPositionCount()}/${max}), skipping buy ${selectedRow.candidate.token.mint}`);
@@ -284,7 +287,7 @@ export async function processCandidateFromSignals(signals) {
       action: selectedRow ? 'entry_not_approved' : 'no_candidate_selected',
       guardrails: {
         agentEnabled: boolSetting('agent_enabled', true),
-        confidenceThreshold: numSetting('llm_min_confidence'),
+        confidenceThreshold: llmBuyMinConfidence(),
         openPositions: openPositionCount(),
         maxOpenPositions: numSetting('max_open_positions', 3),
       },

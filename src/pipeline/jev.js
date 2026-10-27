@@ -168,10 +168,13 @@ function cachedJevAsk(state, questions) {
 
 export function _resetJevCache() { jevAnswers.clear(); }
 
-function llmBuyMinConfidence() { return numSetting('llm_min_confidence', 40); }
-function llmLowConfidenceCap() { return numSetting('llm_low_confidence_cap', 70); }
+// Active strategy's threshold wins (it is what /stratset and the strategy menu edit); global setting is the fallback.
+function llmBuyMinConfidence() {
+  const fromStrategy = finite(activeStrategy()?.llm_min_confidence);
+  return fromStrategy ?? numSetting('llm_min_confidence', 40);
+}
 
-export { llmBuyMinConfidence, llmLowConfidenceCap };
+export { llmBuyMinConfidence };
 
 function defaultTp() {
   return Number(activeStrategy()?.tp_percent) || numSetting('default_tp_percent', 50);
@@ -200,15 +203,6 @@ export function normalizeDecision(parsed, fallbackReason = '') {
   };
 }
 
-export function effectivePositionSizeSol(strat, decision) {
-  const base = Number(strat?.position_size_sol ?? numSetting('dry_run_buy_sol', 0.1));
-  if (decision?.verdict === 'BUY' && Number(decision?.confidence) < llmLowConfidenceCap()) {
-    console.log('[jev] low confidence BUY - position size halved');
-    return base * 0.5;
-  }
-  return base;
-}
-
 function emptyDecision(reason, risks, raw = null) {
   return {
     verdict: 'WATCH',
@@ -221,6 +215,7 @@ function emptyDecision(reason, risks, raw = null) {
     suggested_tp_percent: defaultTp(),
     suggested_sl_percent: defaultSl(),
     raw,
+    row_verdicts: {},
   };
 }
 
@@ -238,6 +233,7 @@ async function mapLimit(items, limit, fn) {
 }
 
 const f2 = n => (Number.isFinite(n) ? n.toFixed(2).replace(/^0/, '') : '?');
+const jevReason = r => `Jev P(BUY)=${f2(r.pBuy)} WATCH=${f2(r.pWatch)} PASS=${f2(r.pPass)} · rug=${f2(r.rug)} · momentum=${r.momentum} · conf=${f2(r.vconf)}`;
 
 export async function decideCandidateBatch(rows, triggerCandidateId) {
   if (!ENABLE_JEV || !TYPESAFE_API_KEY) return emptyDecision('jev disabled', ['no_llm_decision']);
@@ -262,7 +258,7 @@ export async function decideCandidateBatch(rows, triggerCandidateId) {
         pWatch: Number(probs.WATCH) || 0,
         pPass: Number(probs.PASS) || 0,
         vconf: Number(a.verdict?.confidence),
-        rug: Number(a.rug?.noul) || 0,
+        rug: finite(a.rug?.noul) ?? 1, // missing rug answer must not pass the rug veto
         momentum: a.momentum ? MOMENTUM_NAMES[mIdx] : '?',
         answers: a,
         usage: res?.usage,
@@ -288,27 +284,41 @@ export async function decideCandidateBatch(rows, triggerCandidateId) {
 
   const eligible = ok.filter(r => r.choice === 'BUY' && r.rug < maxRug);
   const best = eligible.sort((a, b) => b.pBuy * (1 - b.rug) - a.pBuy * (1 - a.rug))[0] || null;
-  const trigger = ok.find(r => r.row.id === triggerCandidateId) || ok[0];
-  const basis = best || trigger;
 
-  const risks = riskFlagList(basis.row.candidate);
-  if (basis.rug >= maxRug) risks.push('jev_rug_high');
-  const verdict = best ? 'BUY' : (ok.some(r => r.choice === 'WATCH' || r.choice === 'BUY') ? 'WATCH' : 'PASS');
-  const reason = `Jev P(BUY)=${f2(basis.pBuy)} WATCH=${f2(basis.pWatch)} PASS=${f2(basis.pPass)} · rug=${f2(basis.rug)} · momentum=${basis.momentum} · conf=${f2(basis.vconf)}`;
+  // Each screened row keeps its own verdict: a PASS stays PASS (60m cache) instead of becoming WATCH.
+  // A BUY choice that was not selected (rug veto or another row won) is WATCH.
+  const rowVerdicts = {};
+  for (const r of results) {
+    rowVerdicts[r.row.id] = r.error
+      ? { verdict: 'WATCH', confidence: 0, reason: `Jev failed: ${r.error}` }
+      : { verdict: r === best ? 'BUY' : (r.choice === 'PASS' ? 'PASS' : 'WATCH'), confidence: Math.round(r.pBuy * 100), reason: jevReason(r) };
+  }
+
+  // No buy: the batch verdict is the trigger's own, so the card's verdict and reason describe the same token.
+  const trigger = ok.find(r => r.row.id === triggerCandidateId) || null;
+  const basis = best || trigger;
+  const triggerVerdict = rowVerdicts[triggerCandidateId] || { verdict: 'WATCH', confidence: 0, reason: 'Trigger not in batch.' };
+  const verdict = best ? 'BUY' : triggerVerdict.verdict;
+  const reason = basis ? jevReason(basis) : triggerVerdict.reason;
+  const risks = basis ? riskFlagList(basis.row.candidate) : ['jev_error'];
+  if (basis && basis.rug >= maxRug) risks.push('jev_rug_high');
   const decision = normalizeDecision({
     verdict,
-    confidence: Math.round(basis.pBuy * 100),
+    confidence: basis ? Math.round(basis.pBuy * 100) : 0,
     reason,
     risks,
   });
   decision.raw = raw;
+  // normalizeDecision may downgrade a BUY under the confidence threshold; keep the row verdict in step.
+  if (best && decision.verdict !== 'BUY') rowVerdicts[best.row.id].verdict = 'WATCH';
+  decision.row_verdicts = rowVerdicts;
 
   const sel = decision.verdict === 'BUY' ? best.row : null;
   if (decision.verdict === 'PASS' || decision.verdict === 'BUY') {
-    console.log(`[jev-metric] verdict=${decision.verdict} confidence=${decision.confidence} route=${basis.row.candidate?.signals?.route || ''}`);
+    console.log(`[jev-metric] verdict=${decision.verdict} confidence=${decision.confidence} route=${basis?.row.candidate?.signals?.route || ''}`);
   }
   if (decision.verdict === 'WATCH') {
-    const watchMint = trigger.row.candidate?.token?.mint;
+    const watchMint = trigger?.row.candidate?.token?.mint;
     if (watchMint) {
       try {
         storeSignalEvent(watchMint, 'watch', 'jev', { verdict: 'WATCH', confidence: decision.confidence, reason: decision.reason });

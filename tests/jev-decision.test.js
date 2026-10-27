@@ -14,7 +14,7 @@ process.env.ENABLE_JEV = 'true';
 const { default: axios } = await import('axios');
 const { initDb } = await import('../src/db/connection.js');
 initDb();
-const { setSetting } = await import('../src/db/settings.js');
+const { setSetting, activeStrategy, updateStrategyConfig } = await import('../src/db/settings.js');
 const { decideCandidateBatch, buildJevState, jevQuestions, _resetJevCache } = await import('../src/pipeline/jev.js');
 
 setSetting('llm_min_confidence', '40');
@@ -92,6 +92,59 @@ test('failed Jev call is not cached', async () => {
   await decideCandidateBatch([row(1)], 1);
   await decideCandidateBatch([row(1)], 1);
   assert.equal(calls, 2);
+});
+
+const row2 = () => row(2, { metrics: { marketCapUsd: 120_000, liquidityUsd: 30_000, holderCount: 900 } });
+
+test('missing rug answer fails closed', async () => {
+  axios.post = async () => {
+    const res = answer({ choice: 'BUY', pBuy: 0.9, pWatch: 0.05, pPass: 0.05, rug: 0 });
+    delete res.data.answers.rug;
+    return res;
+  };
+  const d = await decideCandidateBatch([row(1)], 1);
+  assert.notEqual(d.verdict, 'BUY');
+  assert.ok(d.risks.includes('jev_rug_high'));
+});
+
+test('each row keeps its own verdict; batch verdict follows the trigger', async () => {
+  axios.post = async (_url, body) => body.state.includes('$120k')
+    ? answer({ choice: 'WATCH', pBuy: 0.3, pWatch: 0.6, pPass: 0.1, rug: 0.1 })
+    : answer({ choice: 'PASS', pBuy: 0.01, pWatch: 0.3, pPass: 0.69, rug: 0.4 });
+  const d = await decideCandidateBatch([row(1), row2()], 1);
+  assert.equal(d.verdict, 'PASS');
+  assert.match(d.reason, /PASS=\.69/);
+  assert.deepEqual([d.row_verdicts[1].verdict, d.row_verdicts[2].verdict], ['PASS', 'WATCH']);
+  assert.equal(d.row_verdicts[2].confidence, 30);
+});
+
+test("failed trigger never borrows another row's reason", async () => {
+  axios.post = async (_url, body) => {
+    if (body.state.includes('$120k')) return answer({ choice: 'WATCH', pBuy: 0.3, pWatch: 0.6, pPass: 0.1, rug: 0.1 });
+    throw Object.assign(new Error('boom'), { response: { status: 400 } });
+  };
+  const d = await decideCandidateBatch([row(1), row2()], 1);
+  assert.equal(d.verdict, 'WATCH');
+  assert.equal(d.confidence, 0);
+  assert.match(d.reason, /Jev failed: boom/);
+  assert.doesNotMatch(d.reason, /P\(BUY\)=\.30/);
+});
+
+test('active strategy llm_min_confidence overrides the global setting', async () => {
+  const strat = activeStrategy();
+  const original = strat.llm_min_confidence;
+  axios.post = async () => answer({ choice: 'BUY', pBuy: 0.72, pWatch: 0.2, pPass: 0.08, rug: 0.1 });
+  try {
+    updateStrategyConfig(strat.id, { ...strat, llm_min_confidence: 80 });
+    const d = await decideCandidateBatch([row(1)], 1);
+    assert.equal(d.verdict, 'WATCH');
+    assert.equal(d.row_verdicts[1].verdict, 'WATCH');
+    updateStrategyConfig(strat.id, { ...strat, llm_min_confidence: 60 });
+    _resetJevCache();
+    assert.equal((await decideCandidateBatch([row(1)], 1)).verdict, 'BUY');
+  } finally {
+    updateStrategyConfig(strat.id, { ...strat, llm_min_confidence: original });
+  }
 });
 
 test('BUY with high rug is vetoed', async () => {

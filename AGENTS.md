@@ -129,7 +129,7 @@ Pre-scoring 0-100 (mcap growth, volume, holder growth, age). ML momentum model `
 ### 5. Jev Decision
 Ngumpulin candidate sampe `llm_candidate_pick_count` atau `llm_candidate_max_age_ms` → Jev (TypeSafe System One, classifier — bukan LLM generatif). Return: verdict BUY/WATCH/PASS, rug, momentum. `llm_min_confidence` = P(BUY)×100. Rug > `jev_max_rug` → ga BUY. Aktif kalo `ENABLE_JEV=true` + `TYPESAFE_API_KEY`.
 
-Cache (tabel `decision_cache`): BUY decisions gak diproses ulang dalam 10 menit, WATCH/PASS dalam 60 menit. Invalidasi kalo mcap berubah >20% atau holders >30%.
+Cache (tabel `decision_cache`): verdict PASS ga diproses ulang dalam 60 menit, WATCH dalam 10 menit (BUY ga di-cache). Tiap token di batch nyimpen verdict Jev-nya sendiri. Invalidasi kalo mcap berubah >20% atau holders >30%.
 
 Route gate: setting `allowed_routes` (comma-separated, empty = all) is the single source of truth. Default excludes `dual_source`, `fee_graduated_trending`, `pumpfun_pregrad`, `graduated_trending` (Lesson #3 — consistently unprofitable).
 
